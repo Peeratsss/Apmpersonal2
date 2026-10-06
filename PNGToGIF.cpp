@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <sstream>
 #include <cwctype>
+#include <cmath>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -21,6 +22,18 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "shell32.lib")
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+// Maximum output resolution.
+// 720p = 1280 x 720.
+//
+// The original aspect ratio is preserved.
+// Images smaller than this are NOT enlarged.
+static const UINT MAX_OUTPUT_WIDTH  = 1280;
+static const UINT MAX_OUTPUT_HEIGHT = 720;
 
 // ============================================================
 // GLOBALS
@@ -74,6 +87,8 @@ static void SetStatus(
             g_hStatus,
             text.c_str()
         );
+
+        UpdateWindow(g_hStatus);
     }
 }
 
@@ -84,8 +99,13 @@ static void SetStatus(
 static bool ChooseFolder()
 {
     BROWSEINFOW bi{};
-    bi.hwndOwner = g_hWnd;
-    bi.lpszTitle = L"Select PNG Frames Folder";
+
+    bi.hwndOwner =
+        g_hWnd;
+
+    bi.lpszTitle =
+        L"Select PNG Frames Folder";
+
     bi.ulFlags =
         BIF_RETURNONLYFSDIRS |
         BIF_NEWDIALOGSTYLE;
@@ -320,6 +340,124 @@ static HRESULT LoadPNG(
 }
 
 // ============================================================
+// RESIZE PNG
+// ============================================================
+
+static HRESULT ResizeBitmap(
+    IWICImagingFactory* factory,
+    IWICBitmapSource* source,
+    IWICBitmap** output
+)
+{
+    if (!factory ||
+        !source ||
+        !output)
+    {
+        return E_INVALIDARG;
+    }
+
+    *output = nullptr;
+
+    UINT sourceWidth = 0;
+    UINT sourceHeight = 0;
+
+    HRESULT hr =
+        source->GetSize(
+            &sourceWidth,
+            &sourceHeight
+        );
+
+    if (FAILED(hr))
+        return hr;
+
+    // Don't upscale smaller images.
+    if (sourceWidth <= MAX_OUTPUT_WIDTH &&
+        sourceHeight <= MAX_OUTPUT_HEIGHT)
+    {
+        return factory->CreateBitmapFromSource(
+            source,
+            WICBitmapCacheOnLoad,
+            output
+        );
+    }
+
+    double scaleX =
+        static_cast<double>(
+            MAX_OUTPUT_WIDTH
+        ) /
+        static_cast<double>(
+            sourceWidth
+        );
+
+    double scaleY =
+        static_cast<double>(
+            MAX_OUTPUT_HEIGHT
+        ) /
+        static_cast<double>(
+            sourceHeight
+        );
+
+    double scale =
+        std::min(
+            scaleX,
+            scaleY
+        );
+
+    UINT newWidth =
+        static_cast<UINT>(
+            std::max(
+                1.0,
+                std::round(
+                    sourceWidth * scale
+                )
+            )
+        );
+
+    UINT newHeight =
+        static_cast<UINT>(
+            std::max(
+                1.0,
+                std::round(
+                    sourceHeight * scale
+                )
+            )
+        );
+
+    IWICBitmapScaler* scaler =
+        nullptr;
+
+    hr =
+        factory->CreateBitmapScaler(
+            &scaler
+        );
+
+    if (FAILED(hr))
+        return hr;
+
+    hr =
+        scaler->Initialize(
+            source,
+            newWidth,
+            newHeight,
+            WICBitmapInterpolationModeFant
+        );
+
+    if (SUCCEEDED(hr))
+    {
+        hr =
+            factory->CreateBitmapFromSource(
+                scaler,
+                WICBitmapCacheOnLoad,
+                output
+            );
+    }
+
+    scaler->Release();
+
+    return hr;
+}
+
+// ============================================================
 // SET GIF FRAME DELAY
 // ============================================================
 
@@ -513,7 +651,7 @@ static bool ConvertPNGFolderToGIF(
         return false;
     }
 
-    // GIF delay is measured in 1/100 second.
+    // GIF delay is 1/100 second.
     UINT delay =
         static_cast<UINT>(
             std::max(
@@ -542,14 +680,18 @@ static bool ConvertPNGFolderToGIF(
             status.str()
         );
 
-        IWICBitmap* bitmap =
+        // ----------------------------------------------------
+        // LOAD ORIGINAL PNG
+        // ----------------------------------------------------
+
+        IWICBitmap* sourceBitmap =
             nullptr;
 
         hr =
             LoadPNG(
                 factory,
                 files[i],
-                &bitmap
+                &sourceBitmap
             );
 
         if (FAILED(hr))
@@ -557,6 +699,32 @@ static bool ConvertPNGFolderToGIF(
             success = false;
             break;
         }
+
+        // ----------------------------------------------------
+        // RESIZE TO MAX 1280x720
+        // ----------------------------------------------------
+
+        IWICBitmap* resizedBitmap =
+            nullptr;
+
+        hr =
+            ResizeBitmap(
+                factory,
+                sourceBitmap,
+                &resizedBitmap
+            );
+
+        sourceBitmap->Release();
+
+        if (FAILED(hr))
+        {
+            success = false;
+            break;
+        }
+
+        // ----------------------------------------------------
+        // CREATE GIF FRAME
+        // ----------------------------------------------------
 
         IWICBitmapFrameEncode* frame =
             nullptr;
@@ -575,7 +743,7 @@ static bool ConvertPNGFolderToGIF(
 
         if (FAILED(hr))
         {
-            bitmap->Release();
+            resizedBitmap->Release();
             success = false;
             break;
         }
@@ -585,13 +753,17 @@ static bool ConvertPNGFolderToGIF(
                 nullptr
             );
 
+        // ----------------------------------------------------
+        // SIZE
+        // ----------------------------------------------------
+
         if (SUCCEEDED(hr))
         {
             UINT width = 0;
             UINT height = 0;
 
             hr =
-                bitmap->GetSize(
+                resizedBitmap->GetSize(
                     &width,
                     &height
                 );
@@ -606,6 +778,10 @@ static bool ConvertPNGFolderToGIF(
             }
         }
 
+        // ----------------------------------------------------
+        // GIF FORMAT
+        // ----------------------------------------------------
+
         if (SUCCEEDED(hr))
         {
             WICPixelFormatGUID format =
@@ -616,6 +792,10 @@ static bool ConvertPNGFolderToGIF(
                     &format
                 );
         }
+
+        // ----------------------------------------------------
+        // PALETTE
+        // ----------------------------------------------------
 
         if (SUCCEEDED(hr))
         {
@@ -631,7 +811,7 @@ static bool ConvertPNGFolderToGIF(
             {
                 hr =
                     palette->InitializeFromBitmap(
-                        bitmap,
+                        resizedBitmap,
                         256,
                         FALSE
                     );
@@ -648,14 +828,22 @@ static bool ConvertPNGFolderToGIF(
             }
         }
 
+        // ----------------------------------------------------
+        // WRITE IMAGE
+        // ----------------------------------------------------
+
         if (SUCCEEDED(hr))
         {
             hr =
                 frame->WriteSource(
-                    bitmap,
+                    resizedBitmap,
                     nullptr
                 );
         }
+
+        // ----------------------------------------------------
+        // FRAME DELAY
+        // ----------------------------------------------------
 
         if (SUCCEEDED(hr))
         {
@@ -666,6 +854,10 @@ static bool ConvertPNGFolderToGIF(
                 );
         }
 
+        // ----------------------------------------------------
+        // COMMIT FRAME
+        // ----------------------------------------------------
+
         if (SUCCEEDED(hr))
         {
             hr =
@@ -673,7 +865,7 @@ static bool ConvertPNGFolderToGIF(
         }
 
         frame->Release();
-        bitmap->Release();
+        resizedBitmap->Release();
 
         if (FAILED(hr))
         {
@@ -681,6 +873,10 @@ static bool ConvertPNGFolderToGIF(
             break;
         }
     }
+
+    // --------------------------------------------------------
+    // COMMIT GIF
+    // --------------------------------------------------------
 
     if (success)
     {
@@ -698,7 +894,7 @@ static bool ConvertPNGFolderToGIF(
     if (success)
     {
         SetStatus(
-            L"Done! GIF created successfully."
+            L"Done! GIF created at max 1280x720."
         );
     }
     else
@@ -1066,7 +1262,7 @@ int WINAPI wWinMain(
         );
 
     // --------------------------------------------------------
-    // CONVERT BUTTON
+    // CONVERT
     // --------------------------------------------------------
 
     g_hConvert =
