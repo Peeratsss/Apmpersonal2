@@ -1,38 +1,37 @@
+#define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
-#define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
 #include <windows.h>
 #include <shlobj.h>
+#include <commdlg.h>
 #include <gdiplus.h>
 
 #include <algorithm>
-#include <filesystem>
-#include <string>
 #include <vector>
-#include <sstream>
-#include <iomanip>
+#include <string>
 #include <cwctype>
+#include <cmath>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "gdiplus.lib")
 
 using namespace Gdiplus;
-namespace fs = std::filesystem;
 
 // ============================================================
 // SETTINGS
 // ============================================================
 
 static const int WINDOW_W = 560;
-static const int WINDOW_H = 300;
+static const int WINDOW_H = 310;
 
-static const int MAX_WIDTH_720P  = 1280;
-static const int MAX_HEIGHT_720P = 720;
+static const int MAX_WIDTH = 1280;
+static const int MAX_HEIGHT = 720;
 
 static const int DEFAULT_FPS = 30;
 
@@ -40,93 +39,173 @@ static const int DEFAULT_FPS = 30;
 // GLOBALS
 // ============================================================
 
-HWND hWindow = nullptr;
-HWND hFolderEdit = nullptr;
-HWND hOutputEdit = nullptr;
-HWND hFpsEdit = nullptr;
-HWND hStatus = nullptr;
-HWND hConvertButton = nullptr;
+static HWND g_hWindow = NULL;
+static HWND g_hFolderEdit = NULL;
+static HWND g_hOutputEdit = NULL;
+static HWND g_hFpsEdit = NULL;
+static HWND g_hStatus = NULL;
+static HWND g_hConvertButton = NULL;
 
-ULONG_PTR g_gdiplusToken = 0;
+static ULONG_PTR g_gdiplusToken = 0;
 
 // ============================================================
-// HELPERS
+// SMALL HELPERS
 // ============================================================
 
-static std::wstring ToLower(const std::wstring& s)
+static std::wstring ToLowerString(const std::wstring& input)
 {
-    std::wstring r = s;
+    std::wstring result = input;
 
-    for (wchar_t& c : r)
-        c = static_cast<wchar_t>(towlower(c));
+    for (size_t i = 0; i < result.size(); ++i)
+    {
+        result[i] =
+            static_cast<wchar_t>(
+                towlower(result[i]));
+    }
 
-    return r;
+    return result;
 }
 
-static bool IsPNG(const fs::path& p)
+static bool IsPNGFile(const std::wstring& filename)
 {
-    if (!p.has_extension())
+    std::wstring lower =
+        ToLowerString(filename);
+
+    if (lower.length() < 4)
         return false;
 
-    return ToLower(p.extension().wstring()) == L".png";
+    return
+        lower.substr(
+            lower.length() - 4) == L".png";
 }
 
-// Natural comparison:
+static std::wstring GetWindowString(HWND hwnd)
+{
+    int length =
+        GetWindowTextLengthW(hwnd);
+
+    if (length <= 0)
+        return L"";
+
+    std::vector<wchar_t> buffer(
+        static_cast<size_t>(length) + 1);
+
+    GetWindowTextW(
+        hwnd,
+        &buffer[0],
+        length + 1);
+
+    return std::wstring(
+        &buffer[0]);
+}
+
+static void SetStatus(const std::wstring& text)
+{
+    if (g_hStatus)
+    {
+        SetWindowTextW(
+            g_hStatus,
+            text.c_str());
+
+        UpdateWindow(g_hStatus);
+    }
+}
+
+// ============================================================
+// NATURAL SORT
 //
 // frame_1.png
 // frame_2.png
 // frame_10.png
 //
-// instead of:
+// rather than:
 //
 // frame_1.png
 // frame_10.png
 // frame_2.png
-//
-static bool NaturalLess(const std::wstring& a, const std::wstring& b)
+// ============================================================
+
+static bool NaturalLess(
+    const std::wstring& a,
+    const std::wstring& b)
 {
     size_t i = 0;
     size_t j = 0;
 
-    while (i < a.size() && j < b.size())
+    while (i < a.length() &&
+           j < b.length())
     {
-        wchar_t ca = static_cast<wchar_t>(towlower(a[i]));
-        wchar_t cb = static_cast<wchar_t>(towlower(b[j]));
+        wchar_t ca =
+            static_cast<wchar_t>(
+                towlower(a[i]));
 
-        if (iswdigit(ca) && iswdigit(cb))
+        wchar_t cb =
+            static_cast<wchar_t>(
+                towlower(b[j]));
+
+        if (iswdigit(ca) &&
+            iswdigit(cb))
         {
-            size_t iStart = i;
-            size_t jStart = j;
+            size_t startA = i;
+            size_t startB = j;
 
-            while (i < a.size() && iswdigit(a[i]))
+            while (i < a.length() &&
+                   iswdigit(a[i]))
+            {
                 ++i;
+            }
 
-            while (j < b.size() && iswdigit(b[j]))
+            while (j < b.length() &&
+                   iswdigit(b[j]))
+            {
                 ++j;
+            }
 
-            std::wstring na = a.substr(iStart, i - iStart);
-            std::wstring nb = b.substr(jStart, j - jStart);
+            std::wstring numberA =
+                a.substr(
+                    startA,
+                    i - startA);
 
-            // Ignore leading zeroes.
-            size_t za = na.find_first_not_of(L'0');
-            size_t zb = nb.find_first_not_of(L'0');
+            std::wstring numberB =
+                b.substr(
+                    startB,
+                    j - startB);
 
-            std::wstring va =
-                (za == std::wstring::npos) ? L"0" : na.substr(za);
+            size_t nonZeroA =
+                numberA.find_first_not_of(L'0');
 
-            std::wstring vb =
-                (zb == std::wstring::npos) ? L"0" : nb.substr(zb);
+            size_t nonZeroB =
+                numberB.find_first_not_of(L'0');
 
-            if (va.length() != vb.length())
-                return va.length() < vb.length();
+            std::wstring valueA =
+                (nonZeroA == std::wstring::npos)
+                ? L"0"
+                : numberA.substr(nonZeroA);
 
-            if (va != vb)
-                return va < vb;
+            std::wstring valueB =
+                (nonZeroB == std::wstring::npos)
+                ? L"0"
+                : numberB.substr(nonZeroB);
+
+            if (valueA.length() != valueB.length())
+            {
+                return valueA.length() <
+                       valueB.length();
+            }
+
+            if (valueA != valueB)
+            {
+                return valueA < valueB;
+            }
 
             // Same numeric value.
-            // Shorter zero-padding comes first.
-            if (na.length() != nb.length())
-                return na.length() < nb.length();
+            // Fewer leading zeroes first.
+            if (numberA.length() !=
+                numberB.length())
+            {
+                return numberA.length() <
+                       numberB.length();
+            }
 
             continue;
         }
@@ -138,16 +217,22 @@ static bool NaturalLess(const std::wstring& a, const std::wstring& b)
         ++j;
     }
 
-    return a.size() < b.size();
+    return a.length() < b.length();
 }
 
-static bool IsAlreadySorted(const std::vector<fs::path>& files)
+static bool IsAlreadySorted(
+    const std::vector<std::wstring>& files)
 {
-    for (size_t i = 1; i < files.size(); ++i)
+    if (files.size() < 2)
+        return true;
+
+    for (size_t i = 1;
+         i < files.size();
+         ++i)
     {
         if (NaturalLess(
-                files[i].filename().wstring(),
-                files[i - 1].filename().wstring()))
+                files[i],
+                files[i - 1]))
         {
             return false;
         }
@@ -156,46 +241,184 @@ static bool IsAlreadySorted(const std::vector<fs::path>& files)
     return true;
 }
 
-static void SetStatus(const std::wstring& text)
-{
-    if (hStatus)
-    {
-        SetWindowTextW(hStatus, text.c_str());
-        UpdateWindow(hStatus);
-    }
-}
+// ============================================================
+// FOLDER PICKER
+// ============================================================
 
 static std::wstring BrowseForFolder(HWND owner)
 {
-    BROWSEINFOW bi{};
-    bi.hwndOwner = owner;
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-    bi.lpszTitle = L"Select PNG frame folder";
+    BROWSEINFOW info;
+    ZeroMemory(
+        &info,
+        sizeof(info));
 
-    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    info.hwndOwner = owner;
+    info.ulFlags =
+        BIF_RETURNONLYFSDIRS |
+        BIF_NEWDIALOGSTYLE;
+
+    info.lpszTitle =
+        L"Select the folder containing PNG frames.";
+
+    PIDLIST_ABSOLUTE pidl =
+        SHBrowseForFolderW(&info);
 
     if (!pidl)
         return L"";
 
-    wchar_t path[MAX_PATH]{};
+    wchar_t path[MAX_PATH];
+    ZeroMemory(
+        path,
+        sizeof(path));
 
     std::wstring result;
 
-    if (SHGetPathFromIDListW(pidl, path))
+    if (SHGetPathFromIDListW(
+            pidl,
+            path))
+    {
         result = path;
+    }
 
     CoTaskMemFree(pidl);
 
     return result;
 }
 
+// ============================================================
+// ENUMERATE PNG FILES
+//
+// Uses Win32 FindFirstFile instead of std::filesystem.
+// This works with the existing MSVC build command.
+// ============================================================
+
+static bool GetPNGFiles(
+    const std::wstring& folder,
+    std::vector<std::wstring>& files)
+{
+    files.clear();
+
+    std::wstring searchPath = folder;
+
+    if (!searchPath.empty())
+    {
+        wchar_t last =
+            searchPath[searchPath.length() - 1];
+
+        if (last != L'\\' &&
+            last != L'/')
+        {
+            searchPath += L'\\';
+        }
+    }
+
+    searchPath += L"*";
+
+    WIN32_FIND_DATAW data;
+    ZeroMemory(
+        &data,
+        sizeof(data));
+
+    HANDLE hFind =
+        FindFirstFileW(
+            searchPath.c_str(),
+            &data);
+
+    if (hFind == INVALID_HANDLE_VALUE)
+        return false;
+
+    do
+    {
+        if (data.dwFileAttributes &
+            FILE_ATTRIBUTE_DIRECTORY)
+        {
+            continue;
+        }
+
+        std::wstring filename =
+            data.cFileName;
+
+        if (!IsPNGFile(filename))
+            continue;
+
+        std::wstring fullPath =
+            folder;
+
+        if (!fullPath.empty())
+        {
+            wchar_t last =
+                fullPath[fullPath.length() - 1];
+
+            if (last != L'\\' &&
+                last != L'/')
+            {
+                fullPath += L'\\';
+            }
+        }
+
+        fullPath += filename;
+
+        files.push_back(fullPath);
+
+    } while (FindNextFileW(
+        hFind,
+        &data));
+
+    FindClose(hFind);
+
+    return !files.empty();
+}
+
+// ============================================================
+// GET FILENAME FROM PATH
+// ============================================================
+
+static std::wstring GetFilename(
+    const std::wstring& path)
+{
+    size_t position =
+        path.find_last_of(
+            L"\\/");
+
+    if (position == std::wstring::npos)
+        return path;
+
+    return path.substr(
+        position + 1);
+}
+
+// ============================================================
+// GET FILE EXTENSION
+// ============================================================
+
+static std::wstring GetExtension(
+    const std::wstring& path)
+{
+    std::wstring filename =
+        GetFilename(path);
+
+    size_t position =
+        filename.find_last_of(L'.');
+
+    if (position == std::wstring::npos)
+        return L"";
+
+    return filename.substr(
+        position);
+}
+
+// ============================================================
+// GET FPS
+// ============================================================
+
 static int GetFPS()
 {
-    wchar_t buffer[64]{};
+    std::wstring value =
+        GetWindowString(
+            g_hFpsEdit);
 
-    GetWindowTextW(hFpsEdit, buffer, 64);
-
-    int fps = _wtoi(buffer);
+    int fps =
+        _wtoi(value.c_str());
 
     if (fps < 1)
         fps = 1;
@@ -206,182 +429,277 @@ static int GetFPS()
     return fps;
 }
 
-static std::wstring GetText(HWND hwnd)
-{
-    int len = GetWindowTextLengthW(hwnd);
-
-    if (len <= 0)
-        return L"";
-
-    std::wstring text(static_cast<size_t>(len) + 1, L'\0');
-
-    GetWindowTextW(hwnd, text.data(), len + 1);
-
-    text.resize(static_cast<size_t>(len));
-
-    return text;
-}
-
 // ============================================================
-// GDI+ GIF ENCODER
+// GIF ENCODER CLSID
 // ============================================================
 
-static int GetEncoderClsid(
-    const WCHAR* format,
-    CLSID* pClsid)
+static bool GetGIFEncoderCLSID(
+    CLSID& clsid)
 {
-    UINT num = 0;
+    UINT number = 0;
     UINT size = 0;
 
-    GetImageEncodersSize(&num, &size);
+    if (GetImageEncodersSize(
+            &number,
+            &size) != Ok)
+    {
+        return false;
+    }
 
     if (size == 0)
-        return -1;
+        return false;
 
     std::vector<BYTE> buffer(size);
 
     ImageCodecInfo* codecs =
-        reinterpret_cast<ImageCodecInfo*>(buffer.data());
+        reinterpret_cast<ImageCodecInfo*>(
+            &buffer[0]);
 
-    if (GetImageEncoders(num, size, codecs) != Ok)
-        return -1;
-
-    for (UINT i = 0; i < num; ++i)
+    if (GetImageEncoders(
+            number,
+            size,
+            codecs) != Ok)
     {
-        if (wcscmp(codecs[i].MimeType, format) == 0)
+        return false;
+    }
+
+    for (UINT i = 0;
+         i < number;
+         ++i)
+    {
+        if (wcscmp(
+                codecs[i].MimeType,
+                L"image/gif") == 0)
         {
-            *pClsid = codecs[i].Clsid;
-            return static_cast<int>(i);
+            clsid =
+                codecs[i].Clsid;
+
+            return true;
         }
     }
 
-    return -1;
+    return false;
 }
 
 // ============================================================
-// RESIZE FRAME
+// LOAD + RESIZE PNG
+//
+// Never upscales.
+// Maximum output is 1280x720.
+// Aspect ratio is preserved.
 // ============================================================
 
-static Bitmap* LoadAndResizeFrame(
-    const fs::path& filename,
-    int& outWidth,
-    int& outHeight)
+static Bitmap* LoadAndResizePNG(
+    const std::wstring& filename,
+    int& outputWidth,
+    int& outputHeight)
 {
-    Bitmap source(filename.wstring().c_str(), FALSE);
+    Bitmap source(
+        filename.c_str(),
+        FALSE);
 
     if (source.GetLastStatus() != Ok)
-        return nullptr;
+        return NULL;
 
-    const UINT originalWidth = source.GetWidth();
-    const UINT originalHeight = source.GetHeight();
+    UINT sourceWidth =
+        source.GetWidth();
 
-    if (originalWidth == 0 || originalHeight == 0)
-        return nullptr;
+    UINT sourceHeight =
+        source.GetHeight();
+
+    if (sourceWidth == 0 ||
+        sourceHeight == 0)
+    {
+        return NULL;
+    }
 
     double scale = 1.0;
 
-    if (originalWidth > MAX_WIDTH_720P ||
-        originalHeight > MAX_HEIGHT_720P)
+    if (sourceWidth > MAX_WIDTH ||
+        sourceHeight > MAX_HEIGHT)
     {
-        double sx =
-            static_cast<double>(MAX_WIDTH_720P) /
-            static_cast<double>(originalWidth);
+        double widthScale =
+            static_cast<double>(MAX_WIDTH) /
+            static_cast<double>(sourceWidth);
 
-        double sy =
-            static_cast<double>(MAX_HEIGHT_720P) /
-            static_cast<double>(originalHeight);
+        double heightScale =
+            static_cast<double>(MAX_HEIGHT) /
+            static_cast<double>(sourceHeight);
 
-        scale = std::min(sx, sy);
+        scale =
+            (widthScale < heightScale)
+            ? widthScale
+            : heightScale;
     }
 
-    outWidth = std::max(
-        1,
+    outputWidth =
         static_cast<int>(
-            originalWidth * scale + 0.5));
+            sourceWidth * scale + 0.5);
 
-    outHeight = std::max(
-        1,
+    outputHeight =
         static_cast<int>(
-            originalHeight * scale + 0.5));
+            sourceHeight * scale + 0.5);
 
-    Bitmap* resized =
+    if (outputWidth < 1)
+        outputWidth = 1;
+
+    if (outputHeight < 1)
+        outputHeight = 1;
+
+    Bitmap* result =
         new Bitmap(
-            outWidth,
-            outHeight,
+            outputWidth,
+            outputHeight,
             PixelFormat32bppARGB);
 
-    if (resized->GetLastStatus() != Ok)
+    if (!result ||
+        result->GetLastStatus() != Ok)
     {
-        delete resized;
-        return nullptr;
+        delete result;
+        return NULL;
     }
 
-    Graphics graphics(resized);
+    Graphics graphics(result);
 
-    graphics.SetCompositingMode(CompositingModeSourceCopy);
-    graphics.SetCompositingQuality(CompositingQualityHighQuality);
-    graphics.SetInterpolationMode(InterpolationModeHighQualityBicubic);
-    graphics.SetPixelOffsetMode(PixelOffsetModeHighQuality);
-    graphics.SetSmoothingMode(SmoothingModeHighQuality);
+    graphics.SetCompositingMode(
+        CompositingModeSourceCopy);
 
-    graphics.Clear(Color(0, 0, 0, 0));
+    graphics.SetCompositingQuality(
+        CompositingQualityHighQuality);
+
+    graphics.SetInterpolationMode(
+        InterpolationModeHighQualityBicubic);
+
+    graphics.SetPixelOffsetMode(
+        PixelOffsetModeHighQuality);
+
+    graphics.SetSmoothingMode(
+        SmoothingModeHighQuality);
+
+    graphics.Clear(
+        Color(0, 0, 0, 0));
 
     Rect destination(
         0,
         0,
-        outWidth,
-        outHeight);
+        outputWidth,
+        outputHeight);
 
-    Status status =
+    Status drawStatus =
         graphics.DrawImage(
             &source,
             destination,
             0,
             0,
-            static_cast<INT>(originalWidth),
-            static_cast<INT>(originalHeight),
+            static_cast<INT>(sourceWidth),
+            static_cast<INT>(sourceHeight),
             UnitPixel);
 
-    if (status != Ok)
+    if (drawStatus != Ok)
     {
-        delete resized;
-        return nullptr;
+        delete result;
+        return NULL;
     }
 
-    return resized;
+    return result;
 }
 
 // ============================================================
-// CREATE GIF
+// SET GIF FRAME PROPERTIES
+// ============================================================
+
+static void SetGIFFrameProperties(
+    Bitmap* bitmap,
+    ULONG delay)
+{
+    if (!bitmap)
+        return;
+
+    // Frame delay is measured in 1/100 second.
+    ULONG frameDelay = delay;
+
+    PropertyItem delayItem;
+    ZeroMemory(
+        &delayItem,
+        sizeof(delayItem));
+
+    delayItem.id =
+        PropertyTagFrameDelay;
+
+    delayItem.length =
+        sizeof(ULONG);
+
+    delayItem.type =
+        PropertyTagTypeLong;
+
+    delayItem.value =
+        &frameDelay;
+
+    bitmap->SetPropertyItem(
+        &delayItem);
+
+    // 0 = infinite loop.
+    USHORT loopCount = 0;
+
+    PropertyItem loopItem;
+    ZeroMemory(
+        &loopItem,
+        sizeof(loopItem));
+
+    loopItem.id =
+        PropertyTagLoopCount;
+
+    loopItem.length =
+        sizeof(USHORT);
+
+    loopItem.type =
+        PropertyTagTypeShort;
+
+    loopItem.value =
+        &loopCount;
+
+    bitmap->SetPropertyItem(
+        &loopItem);
+}
+
+// ============================================================
+// CREATE ANIMATED GIF
 // ============================================================
 
 static bool CreateAnimatedGIF(
-    const std::vector<fs::path>& files,
+    const std::vector<std::wstring>& files,
     const std::wstring& outputFile,
     int fps)
 {
     if (files.empty())
     {
-        SetStatus(L"No PNG files found.");
+        SetStatus(
+            L"No PNG frames found.");
+
         return false;
     }
 
-    CLSID gifClsid{};
+    CLSID gifEncoder;
 
-    if (GetEncoderClsid(L"image/gif", &gifClsid) < 0)
+    if (!GetGIFEncoderCLSID(
+            gifEncoder))
     {
-        SetStatus(L"Could not find GIF encoder.");
+        SetStatus(
+            L"Windows GIF encoder was not found.");
+
         return false;
     }
 
-    // GIF frame delays are measured in 1/100 second.
+    // GIF timing uses hundredths of a second.
     //
-    // Example:
-    // 30 FPS -> 3 = 30ms
-    // 60 FPS -> 2 = 20ms
+    // 30 FPS = approximately 3/100 sec
+    // 60 FPS = approximately 2/100 sec
     //
-    int delay = static_cast<int>(
-        std::round(100.0 / static_cast<double>(fps)));
+    int delay =
+        static_cast<int>(
+            std::round(
+                100.0 /
+                static_cast<double>(fps)));
 
     if (delay < 1)
         delay = 1;
@@ -389,114 +707,101 @@ static bool CreateAnimatedGIF(
     if (delay > 65535)
         delay = 65535;
 
+    // --------------------------------------------------------
     // Load first frame.
+    // --------------------------------------------------------
+
     int width = 0;
     int height = 0;
 
     Bitmap* first =
-        LoadAndResizeFrame(
+        LoadAndResizePNG(
             files[0],
             width,
             height);
 
     if (!first)
     {
-        SetStatus(L"Failed to load first PNG.");
+        SetStatus(
+            L"Could not load the first PNG.");
+
         return false;
     }
 
-    const size_t frameCount = files.size();
+    // GIF requires all frames to have the same canvas size.
+    //
+    // If the first frame is small, the GIF stays at that size.
+    // If it is larger than 720p, it is reduced to 720p.
+    //
+    // Smaller frames are NOT upscaled.
+
+    SetGIFFrameProperties(
+        first,
+        static_cast<ULONG>(delay));
 
     // --------------------------------------------------------
-    // Frame delay metadata
+    // Encoder parameters.
     // --------------------------------------------------------
 
-    std::vector<ULONG> delays(frameCount);
+    EncoderParameters encoderParameters;
+    ZeroMemory(
+        &encoderParameters,
+        sizeof(encoderParameters));
 
-    for (size_t i = 0; i < frameCount; ++i)
-        delays[i] = static_cast<ULONG>(delay);
+    encoderParameters.Count = 1;
 
-    PropertyItem frameDelayItem{};
-
-    frameDelayItem.id = PropertyTagFrameDelay;
-    frameDelayItem.length =
-        static_cast<ULONG>(
-            delays.size() * sizeof(ULONG));
-    frameDelayItem.type = PropertyTagTypeLong;
-    frameDelayItem.value = delays.data();
-
-    first->SetPropertyItem(&frameDelayItem);
-
-    // --------------------------------------------------------
-    // Loop forever
-    // --------------------------------------------------------
-
-    USHORT loopCount = 0;
-
-    PropertyItem loopItem{};
-
-    loopItem.id = PropertyTagLoopCount;
-    loopItem.length = sizeof(USHORT);
-    loopItem.type = PropertyTagTypeShort;
-    loopItem.value = &loopCount;
-
-    first->SetPropertyItem(&loopItem);
-
-    // --------------------------------------------------------
-    // Start multi-frame GIF
-    // --------------------------------------------------------
-
-    EncoderParameters encoderParams{};
-
-    encoderParams.Count = 1;
-
-    encoderParams.Parameter[0].Guid =
+    encoderParameters.Parameter[0].Guid =
         EncoderSaveFlag;
 
-    encoderParams.Parameter[0].Type =
+    encoderParameters.Parameter[0].Type =
         EncoderParameterValueTypeLong;
 
-    encoderParams.Parameter[0].NumberOfValues = 1;
+    encoderParameters.Parameter[0].NumberOfValues =
+        1;
 
     ULONG saveFlag =
         EncoderValueMultiFrame;
 
-    encoderParams.Parameter[0].Value =
+    encoderParameters.Parameter[0].Value =
         &saveFlag;
 
-    DeleteFileW(outputFile.c_str());
+    // Remove existing file.
+    DeleteFileW(
+        outputFile.c_str());
 
     SetStatus(
         L"Creating GIF: frame 1 / " +
-        std::to_wstring(frameCount));
+        std::to_wstring(files.size()));
 
     Status status =
         first->Save(
             outputFile.c_str(),
-            &gifClsid,
-            &encoderParams);
+            &gifEncoder,
+            &encoderParameters);
 
     if (status != Ok)
     {
         delete first;
 
         SetStatus(
-            L"GIF creation failed at first frame.");
+            L"Could not start GIF creation.");
 
         return false;
     }
 
     // --------------------------------------------------------
-    // Add remaining frames
+    // Add frames.
     // --------------------------------------------------------
 
-    for (size_t i = 1; i < frameCount; ++i)
+    for (size_t i = 1;
+         i < files.size();
+         ++i)
     {
         int frameWidth = 0;
         int frameHeight = 0;
 
         Bitmap* frame =
-            LoadAndResizeFrame(
+            LoadAndResizePNG(
                 files[i],
                 frameWidth,
                 frameHeight);
@@ -505,21 +810,24 @@ static bool CreateAnimatedGIF(
         {
             delete first;
 
-            SetStatus(
-                L"Failed to load frame " +
-                std::to_wstring(i + 1));
+            DeleteFileW(
+                outputFile.c_str());
 
-            DeleteFileW(outputFile.c_str());
+            SetStatus(
+                L"Could not load frame " +
+                std::to_wstring(i + 1));
 
             return false;
         }
 
-        // Every GIF frame must have the same dimensions.
+        // ----------------------------------------------------
+        // Every GIF frame needs the same canvas dimensions.
         //
-        // Normally this will already be true because the
-        // source sequence should have identical dimensions.
-        //
-        // If one frame differs, resize it again to match.
+        // If the PNG is a different size, fit it onto the
+        // first frame's canvas without changing its aspect
+        // ratio.
+        // ----------------------------------------------------
+
         if (frameWidth != width ||
             frameHeight != height)
         {
@@ -529,65 +837,110 @@ static bool CreateAnimatedGIF(
                     height,
                     PixelFormat32bppARGB);
 
-            if (corrected->GetLastStatus() != Ok)
+            if (!corrected ||
+                corrected->GetLastStatus() != Ok)
             {
                 delete frame;
+                delete corrected;
                 delete first;
 
-                DeleteFileW(outputFile.c_str());
+                DeleteFileW(
+                    outputFile.c_str());
 
                 SetStatus(
-                    L"Could not resize frame.");
+                    L"Could not prepare GIF frame.");
 
                 return false;
             }
 
-            Graphics g(corrected);
+            Graphics graphics(corrected);
 
-            g.SetCompositingMode(
+            graphics.SetCompositingMode(
                 CompositingModeSourceCopy);
 
-            g.SetCompositingQuality(
+            graphics.SetCompositingQuality(
                 CompositingQualityHighQuality);
 
-            g.SetInterpolationMode(
+            graphics.SetInterpolationMode(
                 InterpolationModeHighQualityBicubic);
 
-            g.SetPixelOffsetMode(
+            graphics.SetPixelOffsetMode(
                 PixelOffsetModeHighQuality);
 
-            g.Clear(
+            graphics.Clear(
                 Color(0, 0, 0, 0));
 
-            g.DrawImage(
+            // Preserve the frame's aspect ratio.
+            double scaleX =
+                static_cast<double>(width) /
+                static_cast<double>(frameWidth);
+
+            double scaleY =
+                static_cast<double>(height) /
+                static_cast<double>(frameHeight);
+
+            double scale =
+                (scaleX < scaleY)
+                ? scaleX
+                : scaleY;
+
+            // Do not upscale.
+            if (scale > 1.0)
+                scale = 1.0;
+
+            int drawWidth =
+                static_cast<int>(
+                    frameWidth * scale + 0.5);
+
+            int drawHeight =
+                static_cast<int>(
+                    frameHeight * scale + 0.5);
+
+            if (drawWidth < 1)
+                drawWidth = 1;
+
+            if (drawHeight < 1)
+                drawHeight = 1;
+
+            int x =
+                (width - drawWidth) / 2;
+
+            int y =
+                (height - drawHeight) / 2;
+
+            graphics.DrawImage(
                 frame,
                 Rect(
-                    0,
-                    0,
-                    width,
-                    height));
+                    x,
+                    y,
+                    drawWidth,
+                    drawHeight));
 
             delete frame;
 
             frame = corrected;
         }
 
+        SetGIFFrameProperties(
+            frame,
+            static_cast<ULONG>(delay));
+
         SetStatus(
             L"Creating GIF: frame " +
             std::to_wstring(i + 1) +
             L" / " +
-            std::to_wstring(frameCount));
+            std::to_wstring(files.size()));
 
         saveFlag =
             EncoderValueFrameDimensionTime;
 
-        encoderParams.Parameter[0].Value =
+        encoderParameters.Parameter[0].Value =
             &saveFlag;
 
         status =
             first->SaveAdd(
                 frame,
-                &encoderParams);
+                &encoderParameters);
 
         delete frame;
 
@@ -595,65 +948,71 @@ static bool CreateAnimatedGIF(
         {
             delete first;
 
-            DeleteFileW(outputFile.c_str());
+            DeleteFileW(
+                outputFile.c_str());
 
             SetStatus(
-                L"GIF creation failed at frame " +
+                L"GIF failed at frame " +
                 std::to_wstring(i + 1));
 
             return false;
         }
 
-        // Give Windows a chance to process window messages.
-        MSG msg{};
+        // Keep the window responsive.
+        MSG message;
 
         while (PeekMessageW(
-            &msg,
-            nullptr,
+            &message,
+            NULL,
             0,
             0,
             PM_REMOVE))
         {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
         }
     }
 
     // --------------------------------------------------------
-    // Finish GIF
+    // Flush GIF encoder.
     // --------------------------------------------------------
 
     saveFlag =
         EncoderValueFlush;
 
-    encoderParams.Parameter[0].Value =
+    encoderParameters.Parameter[0].Value =
         &saveFlag;
 
     status =
         first->SaveAdd(
-            &encoderParams);
+            &encoderParameters);
 
     delete first;
 
     if (status != Ok)
     {
-        DeleteFileW(outputFile.c_str());
+        DeleteFileW(
+            outputFile.c_str());
 
         SetStatus(
-            L"GIF finalization failed.");
+            L"Could not finalize GIF.");
 
         return false;
     }
 
-    // Verify the output actually exists.
+    // --------------------------------------------------------
+    // Verify output.
+    // --------------------------------------------------------
+
     DWORD attributes =
         GetFileAttributesW(
             outputFile.c_str());
 
-    if (attributes == INVALID_FILE_ATTRIBUTES)
+    if (attributes ==
+        INVALID_FILE_ATTRIBUTES)
     {
         SetStatus(
-            L"GIF was not created.");
+            L"GIF file was not created.");
 
         return false;
     }
@@ -662,133 +1021,192 @@ static bool CreateAnimatedGIF(
 }
 
 // ============================================================
-// CONVERSION
+// CONVERT
 // ============================================================
 
 static bool ConvertFolder()
 {
     std::wstring folder =
-        GetText(hFolderEdit);
+        GetWindowString(
+            g_hFolderEdit);
 
     std::wstring output =
-        GetText(hOutputEdit);
+        GetWindowString(
+            g_hOutputEdit);
 
     if (folder.empty())
     {
-        SetStatus(L"Select a PNG folder first.");
+        SetStatus(
+            L"Please select a PNG folder.");
+
         return false;
     }
 
     if (output.empty())
     {
-        SetStatus(L"Select an output GIF.");
+        SetStatus(
+            L"Please select an output GIF.");
+
         return false;
     }
 
-    fs::path folderPath(folder);
-
-    if (!fs::exists(folderPath) ||
-        !fs::is_directory(folderPath))
+    // Remove quotes if the user pasted a quoted path.
+    if (folder.length() >= 2 &&
+        folder[0] == L'"' &&
+        folder[folder.length() - 1] == L'"')
     {
-        SetStatus(L"Selected folder does not exist.");
+        folder =
+            folder.substr(
+                1,
+                folder.length() - 2);
+    }
+
+    if (output.length() >= 2 &&
+        output[0] == L'"' &&
+        output[output.length() - 1] == L'"')
+    {
+        output =
+            output.substr(
+                1,
+                output.length() - 2);
+    }
+
+    DWORD folderAttributes =
+        GetFileAttributesW(
+            folder.c_str());
+
+    if (folderAttributes ==
+        INVALID_FILE_ATTRIBUTES)
+    {
+        SetStatus(
+            L"The selected folder does not exist.");
+
         return false;
     }
 
-    std::vector<fs::path> files;
-
-    try
+    if (!(folderAttributes &
+          FILE_ATTRIBUTE_DIRECTORY))
     {
-        for (const auto& entry :
-             fs::directory_iterator(folderPath))
-        {
-            if (!entry.is_regular_file())
-                continue;
+        SetStatus(
+            L"The selected path is not a folder.");
 
-            if (IsPNG(entry.path()))
-                files.push_back(entry.path());
-        }
-    }
-    catch (...)
-    {
-        SetStatus(L"Could not read the folder.");
-        return false;
-    }
-
-    if (files.empty())
-    {
-        SetStatus(L"No PNG files found in folder.");
         return false;
     }
 
     // --------------------------------------------------------
-    // Check whether the folder is already naturally sorted.
+    // Find PNG files.
+    // --------------------------------------------------------
+
+    std::vector<std::wstring> files;
+
+    if (!GetPNGFiles(
+            folder,
+            files))
+    {
+        SetStatus(
+            L"No PNG files were found.");
+
+        return false;
+    }
+
+    // --------------------------------------------------------
+    // Check order.
     //
-    // If it is already sorted:
-    //     keep the exact discovered order.
+    // If already naturally sorted:
+    //     leave it alone.
     //
-    // If it is not sorted:
-    //     naturally sort it.
+    // If not:
+    //     sort naturally.
     // --------------------------------------------------------
 
     bool alreadySorted =
         IsAlreadySorted(files);
 
-    if (!alreadySorted)
+    if (alreadySorted)
     {
         SetStatus(
-            L"Frames are not sorted. Sorting...");
-
-        std::stable_sort(
-            files.begin(),
-            files.end(),
-            [](const fs::path& a,
-               const fs::path& b)
-            {
-                return NaturalLess(
-                    a.filename().wstring(),
-                    b.filename().wstring());
-            });
+            L"Frames already sorted. Keeping folder order...");
     }
     else
     {
         SetStatus(
-            L"Frames already sorted. Keeping order...");
+            L"Frames not sorted. Sorting naturally...");
+
+        std::stable_sort(
+            files.begin(),
+            files.end(),
+            [](const std::wstring& a,
+               const std::wstring& b)
+            {
+                return NaturalLess(
+                    GetFilename(a),
+                    GetFilename(b));
+            });
     }
 
-    int fps = GetFPS();
-
-    // Make sure the output has .gif.
-    fs::path outputPath(output);
-
-    if (ToLower(outputPath.extension().wstring()) != L".gif")
-        outputPath += L".gif";
-
     // --------------------------------------------------------
-    // Show what is going to happen.
+    // Make sure output ends in .gif.
     // --------------------------------------------------------
 
-    std::wstring status =
-        L"Found " +
+    if (GetExtension(output).empty())
+    {
+        output += L".gif";
+    }
+    else
+    {
+        std::wstring extension =
+            ToLowerString(
+                GetExtension(output));
+
+        if (extension != L".gif")
+        {
+            size_t dot =
+                output.find_last_of(L'.');
+
+            if (dot != std::wstring::npos)
+            {
+                output =
+                    output.substr(0, dot);
+            }
+
+            output += L".gif";
+        }
+    }
+
+    int fps =
+        GetFPS();
+
+    // --------------------------------------------------------
+    // Create animation.
+    // --------------------------------------------------------
+
+    std::wstring startMessage =
+        L"Playing " +
         std::to_wstring(files.size()) +
-        L" PNG frames. Creating flipbook...";
+        L" frames at " +
+        std::to_wstring(fps) +
+        L" FPS...";
 
-    SetStatus(status);
+    SetStatus(
+        startMessage);
 
     bool success =
         CreateAnimatedGIF(
             files,
-            outputPath.wstring(),
+            output,
             fps);
 
     if (success)
     {
-        std::wstring done =
-            L"Done! " +
-            std::to_wstring(files.size()) +
-            L" frames -> " +
-            outputPath.filename().wstring();
+        std::wstring filename =
+            GetFilename(output);
 
-        SetStatus(done);
+        SetStatus(
+            L"Done! Created " +
+            filename +
+            L" (" +
+            std::to_wstring(files.size()) +
+            L" frames)");
     }
 
     return success;
@@ -798,17 +1216,17 @@ static bool ConvertFolder()
 // WINDOW PROCEDURE
 // ============================================================
 
-LRESULT CALLBACK WndProc(
+LRESULT CALLBACK WindowProc(
     HWND hwnd,
-    UINT msg,
+    UINT message,
     WPARAM wParam,
     LPARAM lParam)
 {
-    switch (msg)
+    switch (message)
     {
         case WM_CREATE:
         {
-            HFONT font =
+            HFONT normalFont =
                 CreateFontW(
                     18,
                     0,
@@ -842,24 +1260,31 @@ LRESULT CALLBACK WndProc(
                     DEFAULT_PITCH | FF_DONTCARE,
                     L"Arial");
 
-            CreateWindowW(
-                L"STATIC",
-                L"PNG Flipbook → GIF",
-                WS_CHILD | WS_VISIBLE,
-                20,
-                15,
-                500,
-                30,
-                hwnd,
-                nullptr,
-                nullptr,
-                nullptr);
-
             HWND title =
-                GetDlgItem(hwnd, 0);
+                CreateWindowW(
+                    L"STATIC",
+                    L"PNG Flipbook -> GIF",
+                    WS_CHILD | WS_VISIBLE,
+                    20,
+                    15,
+                    500,
+                    30,
+                    hwnd,
+                    NULL,
+                    NULL,
+                    NULL);
 
-            // Folder label
-            HWND label1 =
+            SendMessageW(
+                title,
+                WM_SETFONT,
+                reinterpret_cast<WPARAM>(boldFont),
+                TRUE);
+
+            // ------------------------------------------------
+            // Folder
+            // ------------------------------------------------
+
+            HWND folderLabel =
                 CreateWindowW(
                     L"STATIC",
                     L"PNG Folder:",
@@ -869,43 +1294,45 @@ LRESULT CALLBACK WndProc(
                     100,
                     25,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                label1,
+                folderLabel,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
-            hFolderEdit =
+            g_hFolderEdit =
                 CreateWindowExW(
                     WS_EX_CLIENTEDGE,
                     L"EDIT",
                     L"",
-                    WS_CHILD | WS_VISIBLE |
+                    WS_CHILD |
+                    WS_VISIBLE |
                     ES_AUTOHSCROLL,
                     120,
                     58,
                     330,
                     28,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                hFolderEdit,
+                g_hFolderEdit,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
             HWND browseFolder =
                 CreateWindowW(
                     L"BUTTON",
                     L"...",
-                    WS_CHILD | WS_VISIBLE |
+                    WS_CHILD |
+                    WS_VISIBLE |
                     BS_PUSHBUTTON,
                     460,
                     58,
@@ -913,8 +1340,8 @@ LRESULT CALLBACK WndProc(
                     28,
                     hwnd,
                     reinterpret_cast<HMENU>(1001),
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL);
 
             SendMessageW(
                 browseFolder,
@@ -922,8 +1349,11 @@ LRESULT CALLBACK WndProc(
                 reinterpret_cast<WPARAM>(boldFont),
                 TRUE);
 
-            // Output label
-            HWND label2 =
+            // ------------------------------------------------
+            // Output
+            // ------------------------------------------------
+
+            HWND outputLabel =
                 CreateWindowW(
                     L"STATIC",
                     L"Output GIF:",
@@ -933,43 +1363,45 @@ LRESULT CALLBACK WndProc(
                     100,
                     25,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                label2,
+                outputLabel,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
-            hOutputEdit =
+            g_hOutputEdit =
                 CreateWindowExW(
                     WS_EX_CLIENTEDGE,
                     L"EDIT",
                     L"output.gif",
-                    WS_CHILD | WS_VISIBLE |
+                    WS_CHILD |
+                    WS_VISIBLE |
                     ES_AUTOHSCROLL,
                     120,
                     98,
                     330,
                     28,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                hOutputEdit,
+                g_hOutputEdit,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
             HWND browseOutput =
                 CreateWindowW(
                     L"BUTTON",
                     L"...",
-                    WS_CHILD | WS_VISIBLE |
+                    WS_CHILD |
+                    WS_VISIBLE |
                     BS_PUSHBUTTON,
                     460,
                     98,
@@ -977,8 +1409,8 @@ LRESULT CALLBACK WndProc(
                     28,
                     hwnd,
                     reinterpret_cast<HMENU>(1002),
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL);
 
             SendMessageW(
                 browseOutput,
@@ -986,8 +1418,11 @@ LRESULT CALLBACK WndProc(
                 reinterpret_cast<WPARAM>(boldFont),
                 TRUE);
 
+            // ------------------------------------------------
             // FPS
-            HWND label3 =
+            // ------------------------------------------------
+
+            HWND fpsLabel =
                 CreateWindowW(
                     L"STATIC",
                     L"FPS:",
@@ -997,64 +1432,70 @@ LRESULT CALLBACK WndProc(
                     100,
                     25,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                label3,
+                fpsLabel,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
-            hFpsEdit =
+            g_hFpsEdit =
                 CreateWindowExW(
                     WS_EX_CLIENTEDGE,
                     L"EDIT",
                     L"30",
-                    WS_CHILD | WS_VISIBLE |
-                    ES_NUMBER | ES_AUTOHSCROLL,
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    ES_NUMBER |
+                    ES_AUTOHSCROLL,
                     120,
                     138,
                     100,
                     28,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                hFpsEdit,
+                g_hFpsEdit,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
             HWND fpsInfo =
                 CreateWindowW(
                     L"STATIC",
-                    L"1–60 FPS   |   Maximum output: 1280×720",
+                    L"1-60 FPS | Max 1280x720",
                     WS_CHILD | WS_VISIBLE,
                     230,
                     140,
                     290,
                     25,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
                 fpsInfo,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
-            // Convert button
-            hConvertButton =
+            // ------------------------------------------------
+            // Convert
+            // ------------------------------------------------
+
+            g_hConvertButton =
                 CreateWindowW(
                     L"BUTTON",
                     L"CREATE GIF",
-                    WS_CHILD | WS_VISIBLE |
+                    WS_CHILD |
+                    WS_VISIBLE |
                     BS_DEFPUSHBUTTON,
                     20,
                     180,
@@ -1062,101 +1503,127 @@ LRESULT CALLBACK WndProc(
                     42,
                     hwnd,
                     reinterpret_cast<HMENU>(1003),
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                hConvertButton,
+                g_hConvertButton,
                 WM_SETFONT,
                 reinterpret_cast<WPARAM>(boldFont),
                 TRUE);
 
+            // ------------------------------------------------
             // Status
-            hStatus =
+            // ------------------------------------------------
+
+            g_hStatus =
                 CreateWindowW(
                     L"STATIC",
                     L"Select a folder containing PNG frames.",
-                    WS_CHILD | WS_VISIBLE,
+                    WS_CHILD |
+                    WS_VISIBLE,
                     20,
                     235,
                     500,
-                    40,
+                    45,
                     hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
+                    NULL,
+                    NULL,
+                    NULL);
 
             SendMessageW(
-                hStatus,
+                g_hStatus,
                 WM_SETFONT,
-                reinterpret_cast<WPARAM>(font),
+                reinterpret_cast<WPARAM>(normalFont),
                 TRUE);
 
             break;
         }
 
+        // ====================================================
+        // BUTTONS
+        // ====================================================
+
         case WM_COMMAND:
         {
-            const int id =
+            int id =
                 LOWORD(wParam);
 
+            // Folder picker
             if (id == 1001)
             {
                 std::wstring folder =
                     BrowseForFolder(hwnd);
 
                 if (!folder.empty())
+                {
                     SetWindowTextW(
-                        hFolderEdit,
+                        g_hFolderEdit,
                         folder.c_str());
+                }
+
+                return 0;
             }
-            else if (id == 1002)
+
+            // Output picker
+            if (id == 1002)
             {
-                OPENFILENAMEW ofn{};
+                OPENFILENAMEW dialog;
+                ZeroMemory(
+                    &dialog,
+                    sizeof(dialog));
 
                 wchar_t filename[MAX_PATH] =
                     L"output.gif";
 
-                ofn.lStructSize =
-                    sizeof(ofn);
+                dialog.lStructSize =
+                    sizeof(dialog);
 
-                ofn.hwndOwner =
+                dialog.hwndOwner =
                     hwnd;
 
-                ofn.lpstrFilter =
-                    L"GIF files (*.gif)\0*.gif\0All files (*.*)\0*.*\0";
+                dialog.lpstrFilter =
+                    L"GIF files (*.gif)\0*.gif\0"
+                    L"All files (*.*)\0*.*\0";
 
-                ofn.lpstrFile =
+                dialog.lpstrFile =
                     filename;
 
-                ofn.nMaxFile =
+                dialog.nMaxFile =
                     MAX_PATH;
 
-                ofn.Flags =
+                dialog.Flags =
                     OFN_OVERWRITEPROMPT |
                     OFN_PATHMUSTEXIST;
 
-                ofn.lpstrDefExt =
+                dialog.lpstrDefExt =
                     L"gif";
 
-                if (GetSaveFileNameW(&ofn))
+                if (GetSaveFileNameW(
+                        &dialog))
                 {
                     SetWindowTextW(
-                        hOutputEdit,
+                        g_hOutputEdit,
                         filename);
                 }
+
+                return 0;
             }
-            else if (id == 1003)
+
+            // Create GIF
+            if (id == 1003)
             {
                 EnableWindow(
-                    hConvertButton,
+                    g_hConvertButton,
                     FALSE);
 
                 ConvertFolder();
 
                 EnableWindow(
-                    hConvertButton,
+                    g_hConvertButton,
                     TRUE);
+
+                return 0;
             }
 
             break;
@@ -1165,13 +1632,13 @@ LRESULT CALLBACK WndProc(
         case WM_DESTROY:
         {
             PostQuitMessage(0);
-            break;
+            return 0;
         }
     }
 
     return DefWindowProcW(
         hwnd,
-        msg,
+        message,
         wParam,
         lParam);
 }
@@ -1186,58 +1653,90 @@ int WINAPI wWinMain(
     PWSTR,
     int nCmdShow)
 {
-    // COM is needed by the folder dialog.
-    CoInitializeEx(
-        nullptr,
-        COINIT_APARTMENTTHREADED);
+    // --------------------------------------------------------
+    // COM
+    // --------------------------------------------------------
 
-    // Start GDI+.
-    GdiplusStartupInput gdiplusStartupInput{};
+    HRESULT comResult =
+        CoInitializeEx(
+            NULL,
+            COINIT_APARTMENTTHREADED);
 
-    gdiplusStartupInput.GdiplusVersion = 1;
+    // --------------------------------------------------------
+    // GDI+
+    // --------------------------------------------------------
+
+    GdiplusStartupInput startupInput;
+    ZeroMemory(
+        &startupInput,
+        sizeof(startupInput));
+
+    startupInput.GdiplusVersion = 1;
 
     if (GdiplusStartup(
             &g_gdiplusToken,
-            &gdiplusStartupInput,
-            nullptr) != Ok)
+            &startupInput,
+            NULL) != Ok)
     {
         MessageBoxW(
-            nullptr,
-            L"Could not start GDI+.",
+            NULL,
+            L"Could not initialize GDI+.",
             L"PNG to GIF",
             MB_ICONERROR);
 
-        CoUninitialize();
+        if (SUCCEEDED(comResult))
+            CoUninitialize();
 
         return 1;
     }
 
+    // --------------------------------------------------------
+    // Window class
+    // --------------------------------------------------------
+
     const wchar_t CLASS_NAME[] =
         L"PNGToGIFFlipbookWindow";
 
-    WNDCLASSW wc{};
+    WNDCLASSW windowClass;
+    ZeroMemory(
+        &windowClass,
+        sizeof(windowClass));
 
-    wc.lpfnWndProc =
-        WndProc;
+    windowClass.lpfnWndProc =
+        WindowProc;
 
-    wc.hInstance =
+    windowClass.hInstance =
         hInstance;
 
-    wc.lpszClassName =
+    windowClass.lpszClassName =
         CLASS_NAME;
 
-    wc.hCursor =
+    windowClass.hCursor =
         LoadCursorW(
-            nullptr,
+            NULL,
             IDC_ARROW);
 
-    wc.hbrBackground =
+    windowClass.hbrBackground =
         reinterpret_cast<HBRUSH>(
             COLOR_BTNFACE + 1);
 
-    RegisterClassW(&wc);
+    if (!RegisterClassW(
+            &windowClass))
+    {
+        GdiplusShutdown(
+            g_gdiplusToken);
 
-    hWindow =
+        if (SUCCEEDED(comResult))
+            CoUninitialize();
+
+        return 1;
+    }
+
+    // --------------------------------------------------------
+    // Window
+    // --------------------------------------------------------
+
+    g_hWindow =
         CreateWindowExW(
             0,
             CLASS_NAME,
@@ -1250,44 +1749,55 @@ int WINAPI wWinMain(
             CW_USEDEFAULT,
             WINDOW_W,
             WINDOW_H,
-            nullptr,
-            nullptr,
+            NULL,
+            NULL,
             hInstance,
-            nullptr);
+            NULL);
 
-    if (!hWindow)
+    if (!g_hWindow)
     {
         GdiplusShutdown(
             g_gdiplusToken);
 
-        CoUninitialize();
+        if (SUCCEEDED(comResult))
+            CoUninitialize();
 
         return 1;
     }
 
     ShowWindow(
-        hWindow,
+        g_hWindow,
         nCmdShow);
 
-    UpdateWindow(hWindow);
+    UpdateWindow(
+        g_hWindow);
 
-    MSG msg{};
+    // --------------------------------------------------------
+    // Message loop
+    // --------------------------------------------------------
+
+    MSG message;
 
     while (GetMessageW(
-        &msg,
-        nullptr,
+        &message,
+        NULL,
         0,
         0) > 0)
     {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
+
+    // --------------------------------------------------------
+    // Cleanup
+    // --------------------------------------------------------
 
     GdiplusShutdown(
         g_gdiplusToken);
 
-    CoUninitialize();
+    if (SUCCEEDED(comResult))
+        CoUninitialize();
 
     return static_cast<int>(
-        msg.wParam);
+        message.wParam);
 }
