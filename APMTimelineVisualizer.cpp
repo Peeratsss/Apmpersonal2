@@ -11,6 +11,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mftransform.h>
+#include <wincodec.h>
 
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@
 #include <sstream>
 #include <cwctype>
 #include <cmath>
+#include <cstring>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -25,6 +27,7 @@
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 // ============================================================
 // SETTINGS
@@ -61,6 +64,7 @@ static HWND hwndLoad = nullptr;
 static HWND hwndPlay = nullptr;
 static HWND hwndReset = nullptr;
 static HWND hwndExport = nullptr;
+static HWND hwndExportPNG = nullptr;
 
 static std::vector<TimelineEvent> events;
 
@@ -1214,6 +1218,31 @@ static HBITMAP CreateVideoBitmap(
 }
 
 // ============================================================
+// GET EXE DIRECTORY
+// ============================================================
+
+static std::wstring GetExeDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+
+    GetModuleFileNameW(
+        nullptr,
+        path,
+        MAX_PATH
+    );
+
+    std::wstring result(path);
+
+    size_t slash =
+        result.find_last_of(L"\\/");
+
+    if (slash != std::wstring::npos)
+        result.resize(slash);
+
+    return result;
+}
+
+// ============================================================
 // EXPORT MP4
 // ============================================================
 
@@ -1233,29 +1262,8 @@ static bool ExportMP4()
     }
 
     std::wstring outputPath =
-        []()
-        {
-            wchar_t path[MAX_PATH]{};
-
-            GetModuleFileNameW(
-                nullptr,
-                path,
-                MAX_PATH
-            );
-
-            std::wstring result(path);
-
-            size_t slash =
-                result.find_last_of(
-                    L"\\/"
-                );
-
-            if (slash != std::wstring::npos)
-                result.resize(slash);
-
-            return result +
-                L"\\APM_Replay.mp4";
-        }();
+        GetExeDirectory() +
+        L"\\APM_Replay.mp4";
 
     HRESULT hr =
         MFStartup(
@@ -1264,7 +1272,17 @@ static bool ExportMP4()
         );
 
     if (FAILED(hr))
+    {
+        MessageBoxW(
+            hwndMain,
+            L"Could not start Windows Media Foundation.",
+            L"Export MP4",
+            MB_OK |
+            MB_ICONERROR
+        );
+
         return false;
+    }
 
     IMFAttributes* attributes = nullptr;
     IMFSinkWriter* writer = nullptr;
@@ -1284,10 +1302,11 @@ static bool ExportMP4()
         if (FAILED(hr))
             break;
 
+        // FALSE is more compatible with older GPUs/drivers.
         hr =
             attributes->SetUINT32(
                 MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-                TRUE
+                FALSE
             );
 
         if (FAILED(hr))
@@ -1426,7 +1445,10 @@ static bool ExportMP4()
             );
 
         if (!bitmap)
+        {
+            hr = E_FAIL;
             break;
+        }
 
         HBITMAP oldBitmap =
             static_cast<HBITMAP>(
@@ -1435,9 +1457,6 @@ static bool ExportMP4()
                     bitmap
                 )
             );
-
-        IMFMediaBuffer* buffer = nullptr;
-        IMFSample* sample = nullptr;
 
         const long long totalFrames =
             static_cast<long long>(
@@ -1462,24 +1481,25 @@ static bool ExportMP4()
                 currentTime
             );
 
-            RECT scene{
-                0,
-                0,
-                VIDEO_WIDTH,
-                VIDEO_HEIGHT
-            };
-
             RenderScene(
                 videoDC,
                 VIDEO_WIDTH,
                 VIDEO_HEIGHT
             );
 
+            IMFMediaBuffer* buffer = nullptr;
+            IMFSample* sample = nullptr;
+
+            const DWORD byteCount =
+                static_cast<DWORD>(
+                    static_cast<size_t>(VIDEO_WIDTH) *
+                    static_cast<size_t>(VIDEO_HEIGHT) *
+                    4
+                );
+
             hr =
                 MFCreateMemoryBuffer(
-                    VIDEO_WIDTH *
-                    VIDEO_HEIGHT *
-                    4,
+                    byteCount,
                     &buffer
                 );
 
@@ -1504,15 +1524,6 @@ static bool ExportMP4()
                 break;
             }
 
-            const size_t byteCount =
-                static_cast<size_t>(
-                    VIDEO_WIDTH
-                ) *
-                static_cast<size_t>(
-                    VIDEO_HEIGHT
-                ) *
-                4;
-
             memcpy(
                 destination,
                 bits,
@@ -1523,9 +1534,7 @@ static bool ExportMP4()
 
             hr =
                 buffer->SetCurrentLength(
-                    static_cast<DWORD>(
-                        byteCount
-                    )
+                    byteCount
                 );
 
             if (FAILED(hr))
@@ -1668,6 +1677,418 @@ static bool ExportMP4()
 }
 
 // ============================================================
+// EXPORT PNG SEQUENCE
+// ============================================================
+
+static bool ExportPNGSequence()
+{
+    if (events.empty())
+    {
+        MessageBoxW(
+            hwndMain,
+            L"Load a timeline first.",
+            L"Export PNG",
+            MB_OK |
+            MB_ICONWARNING
+        );
+
+        return false;
+    }
+
+    std::wstring outputFolder =
+        GetExeDirectory() +
+        L"\\APM_Replay_Frames";
+
+    // Create output folder.
+    CreateDirectoryW(
+        outputFolder.c_str(),
+        nullptr
+    );
+
+    // Delete old frame files so the folder does not contain
+    // stale frames from a previous longer export.
+    std::wstring searchPattern =
+        outputFolder +
+        L"\\frame_*.png";
+
+    WIN32_FIND_DATAW findData{};
+
+    HANDLE findHandle =
+        FindFirstFileW(
+            searchPattern.c_str(),
+            &findData
+        );
+
+    if (findHandle != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            {
+                std::wstring oldFile =
+                    outputFolder +
+                    L"\\" +
+                    findData.cFileName;
+
+                DeleteFileW(
+                    oldFile.c_str()
+                );
+            }
+
+        } while (
+            FindNextFileW(
+                findHandle,
+                &findData
+            )
+        );
+
+        FindClose(findHandle);
+    }
+
+    HRESULT hr =
+        CoInitializeEx(
+            nullptr,
+            COINIT_MULTITHREADED
+        );
+
+    bool comInitialized =
+        SUCCEEDED(hr);
+
+    if (
+        FAILED(hr) &&
+        hr != RPC_E_CHANGED_MODE
+    )
+    {
+        MessageBoxW(
+            hwndMain,
+            L"Could not initialize Windows Imaging Component.",
+            L"PNG Export Failed",
+            MB_OK |
+            MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    IWICImagingFactory* factory = nullptr;
+
+    hr =
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+
+    if (FAILED(hr))
+    {
+        if (comInitialized)
+            CoUninitialize();
+
+        MessageBoxW(
+            hwndMain,
+            L"Could not initialize the PNG encoder.",
+            L"PNG Export Failed",
+            MB_OK |
+            MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    HDC videoDC = nullptr;
+    void* bits = nullptr;
+
+    HBITMAP bitmap =
+        CreateVideoBitmap(
+            &videoDC,
+            &bits
+        );
+
+    if (!bitmap)
+    {
+        factory->Release();
+
+        if (comInitialized)
+            CoUninitialize();
+
+        MessageBoxW(
+            hwndMain,
+            L"Could not create the video rendering surface.",
+            L"PNG Export Failed",
+            MB_OK |
+            MB_ICONERROR
+        );
+
+        return false;
+    }
+
+    HBITMAP oldBitmap =
+        static_cast<HBITMAP>(
+            SelectObject(
+                videoDC,
+                bitmap
+            )
+        );
+
+    const long long totalFrames =
+        static_cast<long long>(
+            std::ceil(
+                duration *
+                static_cast<double>(FPS)
+            )
+        );
+
+    const size_t pixelCount =
+        static_cast<size_t>(VIDEO_WIDTH) *
+        static_cast<size_t>(VIDEO_HEIGHT);
+
+    const size_t byteCount =
+        pixelCount * 4;
+
+    std::vector<BYTE> bgraPixels(
+        byteCount
+    );
+
+    bool success = true;
+
+    for (
+        long long frame = 0;
+        frame < totalFrames;
+        ++frame
+    )
+    {
+        currentTime =
+            static_cast<double>(frame) /
+            static_cast<double>(FPS);
+
+        ResetPlaybackState();
+
+        ProcessEventsTo(
+            currentTime
+        );
+
+        RenderScene(
+            videoDC,
+            VIDEO_WIDTH,
+            VIDEO_HEIGHT
+        );
+
+        // The DIB is BGRX.
+        // PNG uses BGRA here, so explicitly set alpha to 255.
+        BYTE* source =
+            static_cast<BYTE*>(bits);
+
+        for (
+            size_t i = 0;
+            i < pixelCount;
+            ++i
+        )
+        {
+            bgraPixels[i * 4 + 0] =
+                source[i * 4 + 0];
+
+            bgraPixels[i * 4 + 1] =
+                source[i * 4 + 1];
+
+            bgraPixels[i * 4 + 2] =
+                source[i * 4 + 2];
+
+            bgraPixels[i * 4 + 3] =
+                255;
+        }
+
+        wchar_t filename[64]{};
+
+        swprintf_s(
+            filename,
+            L"frame_%06lld.png",
+            frame
+        );
+
+        std::wstring outputPath =
+            outputFolder +
+            L"\\" +
+            filename;
+
+        IWICStream* stream = nullptr;
+        IWICBitmapEncoder* encoder = nullptr;
+        IWICBitmapFrameEncode* frameEncoder = nullptr;
+        IPropertyBag2* propertyBag = nullptr;
+
+        hr =
+            factory->CreateStream(
+                &stream
+            );
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                stream->InitializeFromFilename(
+                    outputPath.c_str(),
+                    GENERIC_WRITE
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                factory->CreateEncoder(
+                    GUID_ContainerFormatPng,
+                    nullptr,
+                    &encoder
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                encoder->Initialize(
+                    stream,
+                    WICBitmapEncoderNoCache
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                encoder->CreateNewFrame(
+                    &frameEncoder,
+                    &propertyBag
+                );
+        }
+
+        if (propertyBag)
+        {
+            propertyBag->Release();
+            propertyBag = nullptr;
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frameEncoder->Initialize(
+                    nullptr
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frameEncoder->SetSize(
+                    VIDEO_WIDTH,
+                    VIDEO_HEIGHT
+                );
+        }
+
+        WICPixelFormatGUID pixelFormat =
+            GUID_WICPixelFormat32bppBGRA;
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frameEncoder->SetPixelFormat(
+                    &pixelFormat
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frameEncoder->WritePixels(
+                    VIDEO_HEIGHT,
+                    VIDEO_WIDTH * 4,
+                    static_cast<UINT>(
+                        byteCount
+                    ),
+                    bgraPixels.data()
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frameEncoder->Commit();
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                encoder->Commit();
+        }
+
+        if (frameEncoder)
+            frameEncoder->Release();
+
+        if (encoder)
+            encoder->Release();
+
+        if (stream)
+            stream->Release();
+
+        if (FAILED(hr))
+        {
+            success = false;
+            break;
+        }
+    }
+
+    SelectObject(
+        videoDC,
+        oldBitmap
+    );
+
+    DeleteObject(bitmap);
+    DeleteDC(videoDC);
+
+    factory->Release();
+
+    if (comInitialized)
+        CoUninitialize();
+
+    currentTime = 0.0;
+    ResetPlaybackState();
+
+    if (success)
+    {
+        std::wstring message =
+            L"PNG sequence exported successfully:\n\n" +
+            outputFolder +
+            L"\n\n" +
+            std::to_wstring(totalFrames) +
+            L" frames at " +
+            std::to_wstring(FPS) +
+            L" FPS.";
+
+        MessageBoxW(
+            hwndMain,
+            message.c_str(),
+            L"Export Complete",
+            MB_OK |
+            MB_ICONINFORMATION
+        );
+    }
+    else
+    {
+        MessageBoxW(
+            hwndMain,
+            L"PNG sequence export failed.",
+            L"Export Failed",
+            MB_OK |
+            MB_ICONERROR
+        );
+    }
+
+    InvalidateRect(
+        hwndMain,
+        nullptr,
+        TRUE
+    );
+
+    return success;
+}
+
+// ============================================================
 // WINDOW PROCEDURE
 // ============================================================
 
@@ -1783,6 +2204,23 @@ static LRESULT CALLBACK WindowProc(
                     nullptr
                 );
 
+            hwndExportPNG =
+                CreateWindowW(
+                    L"BUTTON",
+                    L"Export PNG",
+                    WS_CHILD |
+                    WS_VISIBLE |
+                    BS_PUSHBUTTON,
+                    540,
+                    255,
+                    130,
+                    40,
+                    hwnd,
+                    reinterpret_cast<HMENU>(1005),
+                    nullptr,
+                    nullptr
+                );
+
             QueryPerformanceFrequency(
                 &performanceFrequency
             );
@@ -1853,6 +2291,10 @@ static LRESULT CALLBACK WindowProc(
 
                 case 1004:
                     ExportMP4();
+                    return 0;
+
+                case 1005:
+                    ExportPNGSequence();
                     return 0;
             }
 
