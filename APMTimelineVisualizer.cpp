@@ -5,7 +5,8 @@
 
 #include <windows.h>
 #include <windowsx.h>
-
+#include <objbase.h>
+#include <wincodec.h>
 
 #include <string>
 #include <vector>
@@ -15,7 +16,10 @@
 #include <cmath>
 #include <cstring>
 
-
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "ole32.lib")
 
 // ============================================================
 // SETTINGS
@@ -51,11 +55,9 @@ static HWND hwndTimeline = nullptr;
 static HWND hwndLoad = nullptr;
 static HWND hwndPlay = nullptr;
 static HWND hwndReset = nullptr;
-static HWND hwndExport = nullptr;
 static HWND hwndExportPNG = nullptr;
 
 static std::vector<TimelineEvent> events;
-
 static std::vector<std::wstring> heldKeys;
 
 static size_t processedEventIndex = 0;
@@ -137,12 +139,6 @@ static bool ParseTimestamp(
 )
 {
     std::wstring s = Trim(text);
-
-    // Expected:
-    // 10:46:46.533 PM
-    //
-    // Also accepts:
-    // 10 46 46.533 PM
 
     for (wchar_t& c : s)
     {
@@ -240,9 +236,6 @@ static bool ParseTimeline(
         }
         else
         {
-            // Find AM/PM and use everything before it
-            // as timestamp and everything after as input.
-
             std::wstring upper =
                 ToUpper(line);
 
@@ -311,7 +304,6 @@ static bool ParseTimeline(
             continue;
         }
 
-        // Handle midnight rollover.
         if (
             previousClock >= 0.0 &&
             clockSeconds < previousClock
@@ -724,7 +716,6 @@ static void DrawKeyboard(
     const int startX = 300;
     const int startY = 390;
 
-    // Number row
     const wchar_t* numbers[] =
     {
         L"1", L"2", L"3", L"4", L"5",
@@ -743,7 +734,6 @@ static void DrawKeyboard(
         );
     }
 
-    // Q row
     const wchar_t* qrow[] =
     {
         L"Q", L"W", L"E", L"R", L"T",
@@ -762,7 +752,6 @@ static void DrawKeyboard(
         );
     }
 
-    // A row
     const wchar_t* arow[] =
     {
         L"A", L"S", L"D", L"F", L"G",
@@ -781,7 +770,6 @@ static void DrawKeyboard(
         );
     }
 
-    // Z row
     const wchar_t* zrow[] =
     {
         L"Z", L"X", L"C", L"V", L"B",
@@ -800,7 +788,6 @@ static void DrawKeyboard(
         );
     }
 
-    // Space
     DrawKey(
         hdc,
         L"Space",
@@ -810,7 +797,6 @@ static void DrawKeyboard(
         keyH
     );
 
-    // Modifiers
     DrawKey(
         hdc,
         L"Left Ctrl",
@@ -1039,7 +1025,6 @@ static void RenderScene(
     DrawKeyboard(hdc);
     DrawMouse(hdc);
 
-    // Progress bar
     const int barX = 250;
     const int barY = 920;
     const int barW = 1420;
@@ -1078,26 +1063,6 @@ static void RenderScene(
             ),
         barY + barH,
         RGB(255, 170, 40)
-    );
-}
-
-// ============================================================
-// PREVIEW
-// ============================================================
-
-static void DrawPreview(
-    HDC hdc,
-    RECT rc
-)
-{
-    ResetPlaybackState();
-
-    ProcessEventsTo(currentTime);
-
-    RenderScene(
-        hdc,
-        rc.right - rc.left,
-        rc.bottom - rc.top
     );
 }
 
@@ -1231,11 +1196,6 @@ static std::wstring GetExeDirectory()
 }
 
 // ============================================================
-// EXPORT MP4
-// ============================================================
-
-
-// ============================================================
 // EXPORT PNG SEQUENCE
 // ============================================================
 
@@ -1258,14 +1218,11 @@ static bool ExportPNGSequence()
         GetExeDirectory() +
         L"\\APM_Replay_Frames";
 
-    // Create output folder.
     CreateDirectoryW(
         outputFolder.c_str(),
         nullptr
     );
 
-    // Delete old frame files so the folder does not contain
-    // stale frames from a previous longer export.
     std::wstring searchPattern =
         outputFolder +
         L"\\frame_*.png";
@@ -1282,7 +1239,10 @@ static bool ExportPNGSequence()
     {
         do
         {
-            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            if (
+                !(findData.dwFileAttributes &
+                  FILE_ATTRIBUTE_DIRECTORY)
+            )
             {
                 std::wstring oldFile =
                     outputFolder +
@@ -1433,8 +1393,6 @@ static bool ExportPNGSequence()
             VIDEO_HEIGHT
         );
 
-        // The DIB is BGRX.
-        // PNG uses BGRA here, so explicitly set alpha to 255.
         BYTE* source =
             static_cast<BYTE*>(bits);
 
@@ -1557,9 +1515,7 @@ static bool ExportPNGSequence()
                 frameEncoder->WritePixels(
                     VIDEO_HEIGHT,
                     VIDEO_WIDTH * 4,
-                    static_cast<UINT>(
-                        byteCount
-                    ),
+                    static_cast<UINT>(byteCount),
                     bgraPixels.data()
                 );
         }
@@ -1746,23 +1702,6 @@ static LRESULT CALLBACK WindowProc(
                     nullptr
                 );
 
-            hwndExport =
-                CreateWindowW(
-                    L"BUTTON",
-                    L"Export MP4",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    BS_PUSHBUTTON,
-                    400,
-                    255,
-                    130,
-                    40,
-                    hwnd,
-                    reinterpret_cast<HMENU>(1004),
-                    nullptr,
-                    nullptr
-                );
-
             hwndExportPNG =
                 CreateWindowW(
                     L"BUTTON",
@@ -1770,7 +1709,7 @@ static LRESULT CALLBACK WindowProc(
                     WS_CHILD |
                     WS_VISIBLE |
                     BS_PUSHBUTTON,
-                    540,
+                    400,
                     255,
                     130,
                     40,
@@ -1847,10 +1786,6 @@ static LRESULT CALLBACK WindowProc(
 
                     return 0;
                 }
-
-                case 1004:
-                    ExportMP4();
-                    return 0;
 
                 case 1005:
                     ExportPNGSequence();
@@ -1938,7 +1873,6 @@ static LRESULT CALLBACK WindowProc(
                 RGB(18, 18, 22)
             );
 
-            // Preview uses scaled scene.
             int previewWidth =
                 client.right;
 
@@ -1995,7 +1929,6 @@ static LRESULT CALLBACK WindowProc(
                             )
                         );
 
-                    // Render directly at preview resolution.
                     ResetPlaybackState();
 
                     ProcessEventsTo(
@@ -2050,7 +1983,7 @@ static LRESULT CALLBACK WindowProc(
                     hwndTimeline,
                     20,
                     20,
-                    width - 40,
+                    std::max(100, width - 40),
                     220,
                     TRUE
                 );
