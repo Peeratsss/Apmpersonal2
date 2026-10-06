@@ -29,6 +29,9 @@ static const UINT REFRESH_MS = 1000;
 
 static const int MAX_KEY_REPEATS = 5;
 
+static const int TOP_BAR_HEIGHT = 6;
+static const int RESIZE_GRIP = 8;
+
 static const UINT WM_TRAYICON = WM_APP + 1;
 
 static const UINT ID_TRAY_CLICKABLE = 1001;
@@ -115,7 +118,7 @@ static std::wstring GetClockTime()
         hour = 12;
     }
 
-    wchar_t buffer[64];
+    wchar_t buffer[64]{};
 
     swprintf_s(
         buffer,
@@ -181,24 +184,31 @@ static void SaveSettings()
 
 static void SaveInputsFile()
 {
+    EnterCriticalSection(&actionLock);
+
     std::wofstream file(GetInputsPath());
 
-    if (!file)
-        return;
-
-    file << L"=== BUTTON PRESS COUNTS ===\n\n";
-
-    for (const auto& pair : buttonCounts)
+    if (file)
     {
-        file << pair.first << L" = " << pair.second << L"\n";
+        file << L"=== BUTTON PRESS COUNTS ===\n\n";
+
+        for (const auto& pair : buttonCounts)
+        {
+            file << pair.first
+                 << L" = "
+                 << pair.second
+                 << L"\n";
+        }
+
+        file << L"\n=== INPUT TIMELINE ===\n\n";
+
+        for (const auto& line : timelineLines)
+        {
+            file << line << L"\n";
+        }
     }
 
-    file << L"\n=== INPUT TIMELINE ===\n\n";
-
-    for (const auto& line : timelineLines)
-    {
-        file << line << L"\n";
-    }
+    LeaveCriticalSection(&actionLock);
 }
 
 // ============================================================
@@ -213,7 +223,11 @@ static void ResetAPM()
 
     LeaveCriticalSection(&actionLock);
 
-    InvalidateRect(hwndOverlay, nullptr, TRUE);
+    InvalidateRect(
+        hwndOverlay,
+        nullptr,
+        TRUE
+    );
 }
 
 static void ResetInputTracker()
@@ -229,7 +243,11 @@ static void ResetInputTracker()
 
     SaveInputsFile();
 
-    InvalidateRect(hwndOverlay, nullptr, TRUE);
+    InvalidateRect(
+        hwndOverlay,
+        nullptr,
+        TRUE
+    );
 }
 
 // ============================================================
@@ -238,16 +256,22 @@ static void ResetInputTracker()
 
 static int GetCurrentAPM()
 {
-    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG now =
+        GetTickCount64();
+
     const ULONGLONG windowStart =
-        (now >= 60000ULL) ? now - 60000ULL : 0;
+        (now >= 60000ULL)
+        ? now - 60000ULL
+        : 0;
 
     EnterCriticalSection(&actionLock);
 
     size_t firstValid = 0;
 
-    while (firstValid < actions.size() &&
-           actions[firstValid] < windowStart)
+    while (
+        firstValid < actions.size() &&
+        actions[firstValid] < windowStart
+    )
     {
         ++firstValid;
     }
@@ -260,7 +284,10 @@ static int GetCurrentAPM()
         );
     }
 
-    int result = static_cast<int>(actions.size());
+    int result =
+        static_cast<int>(
+            actions.size()
+        );
 
     LeaveCriticalSection(&actionLock);
 
@@ -276,9 +303,12 @@ static void RecordInput(
     bool isRelease
 )
 {
-    const std::wstring timestamp = GetClockTime();
+    const std::wstring timestamp =
+        GetClockTime();
 
-    std::wstring line = timestamp;
+    std::wstring line =
+        timestamp;
+
     line += L"\t";
     line += name;
 
@@ -291,7 +321,9 @@ static void RecordInput(
 
     if (!isRelease)
     {
-        actions.push_back(GetTickCount64());
+        actions.push_back(
+            GetTickCount64()
+        );
 
         buttonCounts[name]++;
     }
@@ -300,14 +332,20 @@ static void RecordInput(
 
     SaveInputsFile();
 
-    InvalidateRect(hwndOverlay, nullptr, TRUE);
+    InvalidateRect(
+        hwndOverlay,
+        nullptr,
+        TRUE
+    );
 }
 
 // ============================================================
 // KEY NAMES
 // ============================================================
 
-static std::wstring VirtualKeyToName(DWORD vk)
+static std::wstring VirtualKeyToName(
+    DWORD vk
+)
 {
     switch (vk)
     {
@@ -365,27 +403,45 @@ static std::wstring VirtualKeyToName(DWORD vk)
         case VK_NUMPAD9: return L"Num 9";
     }
 
-    if ((vk >= 'A' && vk <= 'Z') ||
-        (vk >= '0' && vk <= '9'))
+    if (
+        (vk >= 'A' && vk <= 'Z') ||
+        (vk >= '0' && vk <= '9')
+    )
     {
         wchar_t buffer[2]{};
 
-        buffer[0] = static_cast<wchar_t>(vk);
+        buffer[0] =
+            static_cast<wchar_t>(vk);
 
         return buffer;
     }
 
-    UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    UINT scanCode =
+        MapVirtualKeyW(
+            vk,
+            MAPVK_VK_TO_VSC
+        );
 
     if (scanCode == 0)
         return L"Unknown";
 
-    LONG lParam = static_cast<LONG>(scanCode << 16);
+    LONG lParam =
+        static_cast<LONG>(
+            scanCode << 16
+        );
 
     wchar_t name[128]{};
 
-    if (GetKeyNameTextW(lParam, name, 128) > 0)
+    if (
+        GetKeyNameTextW(
+            lParam,
+            name,
+            128
+        ) > 0
+    )
+    {
         return name;
+    }
 
     return L"Unknown";
 }
@@ -403,38 +459,56 @@ static LRESULT CALLBACK KeyboardProc(
     if (nCode == HC_ACTION)
     {
         const KBDLLHOOKSTRUCT* info =
-            reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+            reinterpret_cast<KBDLLHOOKSTRUCT*>(
+                lParam
+            );
 
         if (info)
         {
-            DWORD vk = info->vkCode;
-
-            if (vk != VK_F8 && vk != VK_F9)
+            // Ignore keyboard events generated
+            // by other software.
+            if (!(info->flags & LLKHF_INJECTED))
             {
-                if (wParam == WM_KEYDOWN ||
-                    wParam == WM_SYSKEYDOWN)
-                {
-                    int& repeats = keyRepeatCounts[vk];
+                DWORD vk = info->vkCode;
 
-                    if (repeats < MAX_KEY_REPEATS)
+                if (
+                    vk != VK_F8 &&
+                    vk != VK_F9
+                )
+                {
+                    if (
+                        wParam == WM_KEYDOWN ||
+                        wParam == WM_SYSKEYDOWN
+                    )
                     {
-                        repeats++;
+                        int& repeats =
+                            keyRepeatCounts[vk];
+
+                        if (
+                            repeats <
+                            MAX_KEY_REPEATS
+                        )
+                        {
+                            repeats++;
+
+                            RecordInput(
+                                VirtualKeyToName(vk),
+                                false
+                            );
+                        }
+                    }
+                    else if (
+                        wParam == WM_KEYUP ||
+                        wParam == WM_SYSKEYUP
+                    )
+                    {
+                        keyRepeatCounts[vk] = 0;
 
                         RecordInput(
                             VirtualKeyToName(vk),
-                            false
+                            true
                         );
                     }
-                }
-                else if (wParam == WM_KEYUP ||
-                         wParam == WM_SYSKEYUP)
-                {
-                    keyRepeatCounts[vk] = 0;
-
-                    RecordInput(
-                        VirtualKeyToName(vk),
-                        true
-                    );
                 }
             }
         }
@@ -449,10 +523,12 @@ static LRESULT CALLBACK KeyboardProc(
 }
 
 // ============================================================
-// MOUSE HOOK
+// MOUSE
 // ============================================================
 
-static std::wstring MouseButtonName(DWORD message)
+static std::wstring MouseButtonName(
+    DWORD message
+)
 {
     switch (message)
     {
@@ -467,10 +543,6 @@ static std::wstring MouseButtonName(DWORD message)
         case WM_MBUTTONDOWN:
         case WM_MBUTTONUP:
             return L"MMB";
-
-        case WM_XBUTTONDOWN:
-        case WM_XBUTTONUP:
-            return L"XMB";
     }
 
     return L"Mouse";
@@ -485,60 +557,82 @@ static LRESULT CALLBACK MouseProc(
     if (nCode == HC_ACTION)
     {
         const MSLLHOOKSTRUCT* info =
-            reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+            reinterpret_cast<MSLLHOOKSTRUCT*>(
+                lParam
+            );
 
         if (info)
         {
-            switch (wParam)
+            // Ignore injected mouse events.
+            if (!(info->flags & LLMHF_INJECTED))
             {
-                case WM_LBUTTONDOWN:
-                case WM_RBUTTONDOWN:
-                case WM_MBUTTONDOWN:
-                    RecordInput(
-                        MouseButtonName(
-                            static_cast<DWORD>(wParam)
-                        ),
-                        false
-                    );
-                    break;
-
-                case WM_LBUTTONUP:
-                case WM_RBUTTONUP:
-                case WM_MBUTTONUP:
-                    RecordInput(
-                        MouseButtonName(
-                            static_cast<DWORD>(wParam)
-                        ),
-                        true
-                    );
-                    break;
-
-                case WM_XBUTTONDOWN:
+                switch (wParam)
                 {
-                    WORD button =
-                        HIWORD(info->mouseData);
+                    case WM_LBUTTONDOWN:
+                    case WM_RBUTTONDOWN:
+                    case WM_MBUTTONDOWN:
+                    {
+                        RecordInput(
+                            MouseButtonName(
+                                static_cast<DWORD>(
+                                    wParam
+                                )
+                            ),
+                            false
+                        );
 
-                    std::wstring name =
-                        (button == XBUTTON1)
-                        ? L"X1"
-                        : L"X2";
+                        break;
+                    }
 
-                    RecordInput(name, false);
-                    break;
-                }
+                    case WM_LBUTTONUP:
+                    case WM_RBUTTONUP:
+                    case WM_MBUTTONUP:
+                    {
+                        RecordInput(
+                            MouseButtonName(
+                                static_cast<DWORD>(
+                                    wParam
+                                )
+                            ),
+                            true
+                        );
 
-                case WM_XBUTTONUP:
-                {
-                    WORD button =
-                        HIWORD(info->mouseData);
+                        break;
+                    }
 
-                    std::wstring name =
-                        (button == XBUTTON1)
-                        ? L"X1"
-                        : L"X2";
+                    case WM_XBUTTONDOWN:
+                    {
+                        WORD button =
+                            HIWORD(
+                                info->mouseData
+                            );
 
-                    RecordInput(name, true);
-                    break;
+                        RecordInput(
+                            button == XBUTTON1
+                                ? L"X1"
+                                : L"X2",
+                            false
+                        );
+
+                        break;
+                    }
+
+                    case WM_XBUTTONUP:
+                    {
+                        WORD button =
+                            HIWORD(
+                                info->mouseData
+                            );
+
+                        RecordInput(
+                            button == XBUTTON1
+                                ? L"X1"
+                                : L"X2",
+                            true
+                        );
+
+                        break;
+                    }
                 }
             }
         }
@@ -560,19 +654,32 @@ static NOTIFYICONDATAW trayIcon{};
 
 static void AddTrayIcon()
 {
-    ZeroMemory(&trayIcon, sizeof(trayIcon));
+    ZeroMemory(
+        &trayIcon,
+        sizeof(trayIcon)
+    );
 
-    trayIcon.cbSize = sizeof(trayIcon);
-    trayIcon.hWnd = hwndOverlay;
+    trayIcon.cbSize =
+        sizeof(trayIcon);
+
+    trayIcon.hWnd =
+        hwndOverlay;
+
     trayIcon.uID = 1;
+
     trayIcon.uFlags =
         NIF_MESSAGE |
         NIF_ICON |
         NIF_TIP;
 
-    trayIcon.uCallbackMessage = WM_TRAYICON;
+    trayIcon.uCallbackMessage =
+        WM_TRAYICON;
+
     trayIcon.hIcon =
-        LoadIconW(nullptr, IDI_APPLICATION);
+        LoadIconW(
+            nullptr,
+            IDI_APPLICATION
+        );
 
     wcscpy_s(
         trayIcon.szTip,
@@ -596,9 +703,11 @@ static void RemoveTrayIcon()
 static void ShowTrayMenu()
 {
     POINT pt{};
+
     GetCursorPos(&pt);
 
-    HMENU menu = CreatePopupMenu();
+    HMENU menu =
+        CreatePopupMenu();
 
     if (!menu)
         return;
@@ -606,7 +715,9 @@ static void ShowTrayMenu()
     AppendMenuW(
         menu,
         MF_STRING |
-        (clickableMode ? MF_CHECKED : 0),
+        (clickableMode
+            ? MF_CHECKED
+            : 0),
         ID_TRAY_CLICKABLE,
         clickableMode
             ? L"Pass-through Mode"
@@ -641,7 +752,9 @@ static void ShowTrayMenu()
         L"Exit"
     );
 
-    SetForegroundWindow(hwndOverlay);
+    SetForegroundWindow(
+        hwndOverlay
+    );
 
     TrackPopupMenu(
         menu,
@@ -676,15 +789,31 @@ static void ApplyWindowMode()
 
     if (clickableMode)
     {
-        exStyle &= ~WS_EX_TRANSPARENT;
+        // IMPORTANT:
+        // Remove NOACTIVATE so Windows allows
+        // the overlay to receive focus and
+        // perform normal dragging/resizing.
 
-        style |= WS_THICKFRAME;
+        exStyle &=
+            ~WS_EX_NOACTIVATE;
+
+        exStyle &=
+            ~WS_EX_TRANSPARENT;
+
+        style |=
+            WS_THICKFRAME;
     }
     else
     {
-        exStyle |= WS_EX_TRANSPARENT;
+        // Pass-through mode.
+        exStyle |=
+            WS_EX_NOACTIVATE;
 
-        style &= ~WS_THICKFRAME;
+        exStyle |=
+            WS_EX_TRANSPARENT;
+
+        style &=
+            ~WS_THICKFRAME;
     }
 
     SetWindowLongPtrW(
@@ -699,6 +828,15 @@ static void ApplyWindowMode()
         style
     );
 
+    UINT flags =
+        SWP_FRAMECHANGED |
+        SWP_SHOWWINDOW;
+
+    // Do NOT use SWP_NOACTIVATE when
+    // entering clickable mode.
+    if (!clickableMode)
+        flags |= SWP_NOACTIVATE;
+
     SetWindowPos(
         hwndOverlay,
         HWND_TOPMOST,
@@ -706,9 +844,15 @@ static void ApplyWindowMode()
         overlayY,
         overlayWidth,
         overlayHeight,
-        SWP_FRAMECHANGED |
-        SWP_SHOWWINDOW
+        flags
     );
+
+    if (clickableMode)
+    {
+        SetForegroundWindow(
+            hwndOverlay
+        );
+    }
 
     InvalidateRect(
         hwndOverlay,
@@ -727,10 +871,16 @@ static void PaintOverlay(
 )
 {
     RECT rc{};
-    GetClientRect(hwnd, &rc);
+
+    GetClientRect(
+        hwnd,
+        &rc
+    );
 
     HBRUSH background =
-        CreateSolidBrush(RGB(0, 0, 0));
+        CreateSolidBrush(
+            RGB(0, 0, 0)
+        );
 
     FillRect(
         hdc,
@@ -740,14 +890,14 @@ static void PaintOverlay(
 
     DeleteObject(background);
 
-    // White resize bar in clickable mode
+    // White resize/drag bar.
     if (clickableMode)
     {
         RECT bar{
             0,
             0,
             rc.right,
-            6
+            TOP_BAR_HEIGHT
         };
 
         HBRUSH white =
@@ -775,7 +925,10 @@ static void PaintOverlay(
     );
 
     int fontHeight =
-        max(16, rc.bottom - 14);
+        max(
+            16,
+            rc.bottom - 14
+        );
 
     HFONT font =
         CreateFontW(
@@ -791,7 +944,8 @@ static void PaintOverlay(
             OUT_DEFAULT_PRECIS,
             CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
+            DEFAULT_PITCH |
+            FF_DONTCARE,
             L"Arial"
         );
 
@@ -803,7 +957,7 @@ static void PaintOverlay(
             )
         );
 
-    wchar_t text[64];
+    wchar_t text[64]{};
 
     swprintf_s(
         text,
@@ -813,7 +967,9 @@ static void PaintOverlay(
 
     RECT textRect{
         0,
-        clickableMode ? 6 : 0,
+        clickableMode
+            ? TOP_BAR_HEIGHT
+            : 0,
         rc.right,
         rc.bottom
     };
@@ -877,7 +1033,10 @@ static LRESULT CALLBACK WindowProc(
 
         case WM_TIMER:
         {
-            if (wParam == TIMER_REFRESH)
+            if (
+                wParam ==
+                TIMER_REFRESH
+            )
             {
                 InvalidateRect(
                     hwnd,
@@ -889,10 +1048,16 @@ static LRESULT CALLBACK WindowProc(
             return 0;
         }
 
+        // ----------------------------------------------------
+        // Keep stored position updated while dragging.
+        // ----------------------------------------------------
+
         case WM_MOVING:
         {
             RECT* r =
-                reinterpret_cast<RECT*>(lParam);
+                reinterpret_cast<RECT*>(
+                    lParam
+                );
 
             if (r)
             {
@@ -903,18 +1068,73 @@ static LRESULT CALLBACK WindowProc(
             return TRUE;
         }
 
+        // ----------------------------------------------------
+        // Keep stored size updated while resizing.
+        // ----------------------------------------------------
+
         case WM_SIZING:
         {
             RECT* r =
-                reinterpret_cast<RECT*>(lParam);
+                reinterpret_cast<RECT*>(
+                    lParam
+                );
 
             if (r)
             {
-                overlayWidth =
+                int width =
                     r->right - r->left;
 
-                overlayHeight =
+                int height =
                     r->bottom - r->top;
+
+                if (width < 80)
+                {
+                    if (
+                        wParam == WMSZ_LEFT ||
+                        wParam == WMSZ_TOPLEFT ||
+                        wParam == WMSZ_BOTTOMLEFT
+                    )
+                    {
+                        r->left =
+                            r->right - 80;
+                    }
+                    else
+                    {
+                        r->right =
+                            r->left + 80;
+                    }
+
+                    width = 80;
+                }
+
+                if (height < 30)
+                {
+                    if (
+                        wParam == WMSZ_TOP ||
+                        wParam == WMSZ_TOPLEFT ||
+                        wParam == WMSZ_TOPRIGHT
+                    )
+                    {
+                        r->top =
+                            r->bottom - 30;
+                    }
+                    else
+                    {
+                        r->bottom =
+                            r->top + 30;
+                    }
+
+                    height = 30;
+                }
+
+                overlayX = r->left;
+                overlayY = r->top;
+
+                overlayWidth =
+                    width;
+
+                overlayHeight =
+                    height;
             }
 
             return TRUE;
@@ -929,8 +1149,11 @@ static LRESULT CALLBACK WindowProc(
                 &r
             );
 
-            overlayX = r.left;
-            overlayY = r.top;
+            overlayX =
+                r.left;
+
+            overlayY =
+                r.top;
 
             overlayWidth =
                 r.right - r.left;
@@ -942,6 +1165,10 @@ static LRESULT CALLBACK WindowProc(
 
             return 0;
         }
+
+        // ----------------------------------------------------
+        // Dragging / resizing.
+        // ----------------------------------------------------
 
         case WM_NCHITTEST:
         {
@@ -959,15 +1186,30 @@ static LRESULT CALLBACK WindowProc(
             );
 
             RECT rc{};
-            GetClientRect(hwnd, &rc);
 
-            const int grip = 8;
+            GetClientRect(
+                hwnd,
+                &rc
+            );
 
-            bool left = pt.x < grip;
-            bool right = pt.x >= rc.right - grip;
-            bool top = pt.y < grip;
-            bool bottom = pt.y >= rc.bottom - grip;
+            const int grip =
+                RESIZE_GRIP;
 
+            bool left =
+                pt.x < grip;
+
+            bool right =
+                pt.x >=
+                rc.right - grip;
+
+            bool top =
+                pt.y < grip;
+
+            bool bottom =
+                pt.y >=
+                rc.bottom - grip;
+
+            // Corners first.
             if (top && left)
                 return HTTOPLEFT;
 
@@ -980,6 +1222,7 @@ static LRESULT CALLBACK WindowProc(
             if (bottom && right)
                 return HTBOTTOMRIGHT;
 
+            // Sides.
             if (left)
                 return HTLEFT;
 
@@ -992,6 +1235,7 @@ static LRESULT CALLBACK WindowProc(
             if (bottom)
                 return HTBOTTOM;
 
+            // Everything else moves the overlay.
             return HTCAPTION;
         }
 
@@ -1008,8 +1252,11 @@ static LRESULT CALLBACK WindowProc(
                         &r
                     );
 
-                    overlayX = r.left;
-                    overlayY = r.top;
+                    overlayX =
+                        r.left;
+
+                    overlayY =
+                        r.top;
 
                     overlayWidth =
                         r.right - r.left;
@@ -1045,18 +1292,45 @@ static LRESULT CALLBACK WindowProc(
 
         case WM_TRAYICON:
         {
-            if (lParam == WM_RBUTTONUP)
+            if (
+                lParam ==
+                WM_RBUTTONUP
+            )
             {
                 ShowTrayMenu();
                 return 0;
             }
 
-            if (lParam == WM_LBUTTONDBLCLK)
+            if (
+                lParam ==
+                WM_LBUTTONDBLCLK
+            )
             {
+                RECT r{};
+
+                GetWindowRect(
+                    hwnd,
+                    &r
+                );
+
+                overlayX =
+                    r.left;
+
+                overlayY =
+                    r.top;
+
+                overlayWidth =
+                    r.right - r.left;
+
+                overlayHeight =
+                    r.bottom - r.top;
+
                 clickableMode =
                     !clickableMode;
 
                 ApplyWindowMode();
+
+                SaveSettings();
 
                 return 0;
             }
@@ -1073,8 +1347,11 @@ static LRESULT CALLBACK WindowProc(
                 &r
             );
 
-            overlayX = r.left;
-            overlayY = r.top;
+            overlayX =
+                r.left;
+
+            overlayY =
+                r.top;
 
             overlayWidth =
                 r.right - r.left;
@@ -1092,7 +1369,8 @@ static LRESULT CALLBACK WindowProc(
                     keyboardHook
                 );
 
-                keyboardHook = nullptr;
+                keyboardHook =
+                    nullptr;
             }
 
             if (mouseHook)
@@ -1101,7 +1379,8 @@ static LRESULT CALLBACK WindowProc(
                     mouseHook
                 );
 
-                mouseHook = nullptr;
+                mouseHook =
+                    nullptr;
             }
 
             KillTimer(
@@ -1159,10 +1438,25 @@ int WINAPI wWinMain(
 
     wc.hbrBackground =
         static_cast<HBRUSH>(
-            GetStockObject(BLACK_BRUSH)
+            GetStockObject(
+                BLACK_BRUSH
+            )
         );
 
-    RegisterClassW(&wc);
+    if (!RegisterClassW(&wc))
+    {
+        DeleteCriticalSection(
+            &actionLock
+        );
+
+        return 1;
+    }
+
+    // Pass-through mode starts with:
+    // NOACTIVATE + TRANSPARENT.
+    //
+    // ApplyWindowMode() removes these when
+    // clickable mode is enabled.
 
     DWORD exStyle =
         WS_EX_LAYERED |
@@ -1211,7 +1505,9 @@ int WINAPI wWinMain(
         SW_SHOWNOACTIVATE
     );
 
-    UpdateWindow(hwndOverlay);
+    UpdateWindow(
+        hwndOverlay
+    );
 
     AddTrayIcon();
 
@@ -1242,12 +1538,14 @@ int WINAPI wWinMain(
 
     MSG msg{};
 
-    while (GetMessageW(
-        &msg,
-        nullptr,
-        0,
-        0
-    ) > 0)
+    while (
+        GetMessageW(
+            &msg,
+            nullptr,
+            0,
+            0
+        ) > 0
+    )
     {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
