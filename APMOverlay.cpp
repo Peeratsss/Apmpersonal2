@@ -10,6 +10,7 @@
 #include <string>
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <map>
 
 #pragma comment(lib, "user32.lib")
@@ -20,58 +21,59 @@
 // SETTINGS
 // ============================================================
 
-static const wchar_t* APP_NAME = L"APM Overlay";
+static const int DEFAULT_WIDTH = 150;
+static const int DEFAULT_HEIGHT = 45;
 
-static int overlayX = 20;
-static int overlayY = 20;
-static int overlayWidth = 150;
-static int overlayHeight = 45;
-
-static const UINT REFRESH_TIMER = 1001;
+static const UINT TIMER_REFRESH = 1;
 static const UINT REFRESH_MS = 1000;
 
 static const int MAX_KEY_REPEATS = 5;
+
+static const UINT WM_TRAYICON = WM_APP + 1;
+
+static const UINT ID_TRAY_CLICKABLE = 1001;
+static const UINT ID_TRAY_RESET_APM = 1002;
+static const UINT ID_TRAY_RESET_INPUT = 1003;
+static const UINT ID_TRAY_EXIT = 1004;
 
 // ============================================================
 // GLOBALS
 // ============================================================
 
 static HWND hwndOverlay = nullptr;
-
 static HHOOK keyboardHook = nullptr;
 static HHOOK mouseHook = nullptr;
 
 static bool clickableMode = false;
 
-static NOTIFYICONDATAW nid{};
+static int overlayWidth = DEFAULT_WIDTH;
+static int overlayHeight = DEFAULT_HEIGHT;
 
-static CRITICAL_SECTION dataLock;
+static int overlayX = 20;
+static int overlayY = 20;
 
 static std::vector<ULONGLONG> actions;
 
+static CRITICAL_SECTION actionLock;
+
+static std::map<DWORD, int> keyRepeatCounts;
 static std::map<std::wstring, int> buttonCounts;
-static std::map<std::wstring, int> keyRepeatCounts;
 
 static std::vector<std::wstring> timelineLines;
 
 // ============================================================
-// FILE PATHS
+// FILE PATH
 // ============================================================
 
 static std::wstring GetExeDirectory()
 {
     wchar_t path[MAX_PATH]{};
 
-    GetModuleFileNameW(
-        nullptr,
-        path,
-        MAX_PATH
-    );
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
 
     std::wstring result(path);
 
-    size_t slash =
-        result.find_last_of(L"\\/");
+    size_t slash = result.find_last_of(L"\\/");
 
     if (slash != std::wstring::npos)
         result.resize(slash);
@@ -81,42 +83,39 @@ static std::wstring GetExeDirectory()
 
 static std::wstring GetSettingsPath()
 {
-    return GetExeDirectory() +
-           L"\\APMOverlay.txt";
+    return GetExeDirectory() + L"\\APMOverlay.txt";
 }
 
 static std::wstring GetInputsPath()
 {
-    return GetExeDirectory() +
-           L"\\Inputs.txt";
+    return GetExeDirectory() + L"\\Inputs.txt";
 }
 
 // ============================================================
-// CLOCK
+// TIME
 // ============================================================
 
 static std::wstring GetClockTime()
 {
     SYSTEMTIME st{};
-
     GetLocalTime(&st);
 
     int hour = st.wHour;
-
-    const wchar_t* suffix = L"AM";
+    const wchar_t* ampm = L"AM";
 
     if (hour >= 12)
     {
-        suffix = L"PM";
+        ampm = L"PM";
 
         if (hour > 12)
             hour -= 12;
     }
-
-    if (hour == 0)
+    else if (hour == 0)
+    {
         hour = 12;
+    }
 
-    wchar_t buffer[128]{};
+    wchar_t buffer[64];
 
     swprintf_s(
         buffer,
@@ -125,137 +124,64 @@ static std::wstring GetClockTime()
         st.wMinute,
         st.wSecond,
         st.wMilliseconds,
-        suffix
+        ampm
     );
 
     return buffer;
 }
 
 // ============================================================
-// SAVE / LOAD WINDOW SETTINGS
+// SETTINGS
 // ============================================================
 
-static void SaveWindowSettings()
+static void LoadSettings()
 {
-    if (!hwndOverlay)
-        return;
-
-    RECT rc{};
-
-    if (!GetWindowRect(
-        hwndOverlay,
-        &rc
-    ))
-    {
-        return;
-    }
-
-    overlayX =
-        rc.left;
-
-    overlayY =
-        rc.top;
-
-    overlayWidth =
-        rc.right - rc.left;
-
-    overlayHeight =
-        rc.bottom - rc.top;
-
-    if (overlayWidth < 80)
-        overlayWidth = 80;
-
-    if (overlayHeight < 30)
-        overlayHeight = 30;
-
-    std::wofstream file(
-        GetSettingsPath()
-    );
+    std::wifstream file(GetSettingsPath());
 
     if (!file)
         return;
 
-    file << L"X="
-         << overlayX
-         << L"\n";
+    std::wstring key;
 
-    file << L"Y="
-         << overlayY
-         << L"\n";
+    while (file >> key)
+    {
+        if (key == L"X")
+            file >> overlayX;
+        else if (key == L"Y")
+            file >> overlayY;
+        else if (key == L"WIDTH")
+            file >> overlayWidth;
+        else if (key == L"HEIGHT")
+            file >> overlayHeight;
+    }
 
-    file << L"Width="
-         << overlayWidth
-         << L"\n";
+    if (overlayWidth < 80)
+        overlayWidth = DEFAULT_WIDTH;
 
-    file << L"Height="
-         << overlayHeight
-         << L"\n";
+    if (overlayHeight < 30)
+        overlayHeight = DEFAULT_HEIGHT;
 }
 
-static void LoadWindowSettings()
+static void SaveSettings()
 {
-    std::wifstream file(
-        GetSettingsPath()
-    );
+    std::wofstream file(GetSettingsPath());
 
     if (!file)
         return;
 
-    std::wstring line;
-
-    while (std::getline(
-        file,
-        line
-    ))
-    {
-        size_t eq =
-            line.find(L'=');
-
-        if (eq == std::wstring::npos)
-            continue;
-
-        std::wstring key =
-            line.substr(
-                0,
-                eq
-            );
-
-        std::wstring value =
-            line.substr(
-                eq + 1
-            );
-
-        int number =
-            _wtoi(
-                value.c_str()
-            );
-
-        if (key == L"X")
-            overlayX = number;
-        else if (key == L"Y")
-            overlayY = number;
-        else if (key == L"Width")
-            overlayWidth = number;
-        else if (key == L"Height")
-            overlayHeight = number;
-    }
-
-    if (overlayWidth < 80)
-        overlayWidth = 80;
-
-    if (overlayHeight < 30)
-        overlayHeight = 30;
+    file << L"X " << overlayX << L"\n";
+    file << L"Y " << overlayY << L"\n";
+    file << L"WIDTH " << overlayWidth << L"\n";
+    file << L"HEIGHT " << overlayHeight << L"\n";
 }
 
 // ============================================================
 // INPUT FILE
 // ============================================================
 
-static void WriteInputsFile()
+static void SaveInputsFile()
 {
-    std::wofstream file(
-        GetInputsPath()
-    );
+    std::wofstream file(GetInputsPath());
 
     if (!file)
         return;
@@ -264,19 +190,14 @@ static void WriteInputsFile()
 
     for (const auto& pair : buttonCounts)
     {
-        file << pair.first
-             << L" = "
-             << pair.second
-             << L"\n";
+        file << pair.first << L" = " << pair.second << L"\n";
     }
 
-    file << L"\n";
-    file << L"=== INPUT TIMELINE ===\n\n";
+    file << L"\n=== INPUT TIMELINE ===\n\n";
 
     for (const auto& line : timelineLines)
     {
-        file << line
-             << L"\n";
+        file << line << L"\n";
     }
 }
 
@@ -286,210 +207,64 @@ static void WriteInputsFile()
 
 static void ResetAPM()
 {
-    EnterCriticalSection(
-        &dataLock
-    );
+    EnterCriticalSection(&actionLock);
 
     actions.clear();
 
-    LeaveCriticalSection(
-        &dataLock
-    );
+    LeaveCriticalSection(&actionLock);
 
-    InvalidateRect(
-        hwndOverlay,
-        nullptr,
-        FALSE
-    );
+    InvalidateRect(hwndOverlay, nullptr, TRUE);
 }
 
 static void ResetInputTracker()
 {
-    EnterCriticalSection(
-        &dataLock
-    );
+    EnterCriticalSection(&actionLock);
 
+    actions.clear();
     buttonCounts.clear();
-    keyRepeatCounts.clear();
     timelineLines.clear();
+    keyRepeatCounts.clear();
 
-    LeaveCriticalSection(
-        &dataLock
-    );
+    LeaveCriticalSection(&actionLock);
 
-    WriteInputsFile();
+    SaveInputsFile();
 
-    InvalidateRect(
-        hwndOverlay,
-        nullptr,
-        FALSE
-    );
+    InvalidateRect(hwndOverlay, nullptr, TRUE);
 }
 
 // ============================================================
-// KEY NAME
+// APM
 // ============================================================
 
-static std::wstring GetKeyName(
-    DWORD vk
-)
+static int GetCurrentAPM()
 {
-    switch (vk)
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG windowStart =
+        (now >= 60000ULL) ? now - 60000ULL : 0;
+
+    EnterCriticalSection(&actionLock);
+
+    size_t firstValid = 0;
+
+    while (firstValid < actions.size() &&
+           actions[firstValid] < windowStart)
     {
-    case VK_SPACE:
-        return L"Space";
-
-    case VK_RETURN:
-        return L"Enter";
-
-    case VK_TAB:
-        return L"Tab";
-
-    case VK_ESCAPE:
-        return L"Esc";
-
-    case VK_BACK:
-        return L"Backspace";
-
-    case VK_SHIFT:
-        return L"Shift";
-
-    case VK_LSHIFT:
-        return L"Left Shift";
-
-    case VK_RSHIFT:
-        return L"Right Shift";
-
-    case VK_CONTROL:
-        return L"Ctrl";
-
-    case VK_LCONTROL:
-        return L"Left Ctrl";
-
-    case VK_RCONTROL:
-        return L"Right Ctrl";
-
-    case VK_MENU:
-        return L"Alt";
-
-    case VK_LMENU:
-        return L"Left Alt";
-
-    case VK_RMENU:
-        return L"Right Alt";
-
-    case VK_CAPITAL:
-        return L"Caps Lock";
-
-    case VK_LEFT:
-        return L"Left";
-
-    case VK_RIGHT:
-        return L"Right";
-
-    case VK_UP:
-        return L"Up";
-
-    case VK_DOWN:
-        return L"Down";
-
-    case VK_DELETE:
-        return L"Delete";
-
-    case VK_INSERT:
-        return L"Insert";
-
-    case VK_HOME:
-        return L"Home";
-
-    case VK_END:
-        return L"End";
-
-    case VK_PRIOR:
-        return L"Page Up";
-
-    case VK_NEXT:
-        return L"Page Down";
-
-    case VK_LWIN:
-        return L"Left Win";
-
-    case VK_RWIN:
-        return L"Right Win";
+        ++firstValid;
     }
 
-    if (vk >= VK_F1 &&
-        vk <= VK_F24)
+    if (firstValid > 0)
     {
-        wchar_t buffer[32]{};
-
-        swprintf_s(
-            buffer,
-            L"F%d",
-            static_cast<int>(
-                vk - VK_F1 + 1
-            )
+        actions.erase(
+            actions.begin(),
+            actions.begin() + firstValid
         );
-
-        return buffer;
     }
 
-    if (vk >= 'A' &&
-        vk <= 'Z')
-    {
-        wchar_t buffer[2]{};
+    int result = static_cast<int>(actions.size());
 
-        buffer[0] =
-            static_cast<wchar_t>(vk);
+    LeaveCriticalSection(&actionLock);
 
-        return buffer;
-    }
-
-    if (vk >= '0' &&
-        vk <= '9')
-    {
-        wchar_t buffer[2]{};
-
-        buffer[0] =
-            static_cast<wchar_t>(vk);
-
-        return buffer;
-    }
-
-    UINT scanCode =
-        MapVirtualKeyW(
-            vk,
-            MAPVK_VK_TO_VSC
-        );
-
-    if (scanCode != 0)
-    {
-        wchar_t name[128]{};
-
-        LONG lParam =
-            static_cast<LONG>(
-                scanCode << 16
-            );
-
-        if (GetKeyNameTextW(
-            lParam,
-            name,
-            128
-        ))
-        {
-            return name;
-        }
-    }
-
-    wchar_t buffer[32]{};
-
-    swprintf_s(
-        buffer,
-        L"VK_%u",
-        static_cast<unsigned int>(vk)
-    );
-
-    return buffer;
+    return result;
 }
 
 // ============================================================
@@ -498,51 +273,121 @@ static std::wstring GetKeyName(
 
 static void RecordInput(
     const std::wstring& name,
-    bool isDown
+    bool isRelease
 )
 {
-    ULONGLONG now =
-        GetTickCount64();
+    const std::wstring timestamp = GetClockTime();
 
-    EnterCriticalSection(
-        &dataLock
-    );
+    std::wstring line = timestamp;
+    line += L"\t";
+    line += name;
 
-    if (isDown)
+    if (isRelease)
+        line += L"_UP";
+
+    EnterCriticalSection(&actionLock);
+
+    timelineLines.push_back(line);
+
+    if (!isRelease)
     {
-        actions.push_back(
-            now
-        );
+        actions.push_back(GetTickCount64());
 
         buttonCounts[name]++;
-
-        timelineLines.push_back(
-            GetClockTime() +
-            L"\t" +
-            name
-        );
     }
-    else
+
+    LeaveCriticalSection(&actionLock);
+
+    SaveInputsFile();
+
+    InvalidateRect(hwndOverlay, nullptr, TRUE);
+}
+
+// ============================================================
+// KEY NAMES
+// ============================================================
+
+static std::wstring VirtualKeyToName(DWORD vk)
+{
+    switch (vk)
     {
-        timelineLines.push_back(
-            GetClockTime() +
-            L"\t" +
-            name +
-            L"_UP"
-        );
+        case VK_SPACE: return L"Space";
+        case VK_RETURN: return L"Enter";
+        case VK_TAB: return L"Tab";
+        case VK_ESCAPE: return L"Esc";
+        case VK_BACK: return L"Backspace";
+
+        case VK_LSHIFT: return L"Left Shift";
+        case VK_RSHIFT: return L"Right Shift";
+
+        case VK_LCONTROL: return L"Left Ctrl";
+        case VK_RCONTROL: return L"Right Ctrl";
+
+        case VK_LMENU: return L"Left Alt";
+        case VK_RMENU: return L"Right Alt";
+
+        case VK_CAPITAL: return L"Caps Lock";
+
+        case VK_LEFT: return L"Left";
+        case VK_RIGHT: return L"Right";
+        case VK_UP: return L"Up";
+        case VK_DOWN: return L"Down";
+
+        case VK_INSERT: return L"Insert";
+        case VK_DELETE: return L"Delete";
+        case VK_HOME: return L"Home";
+        case VK_END: return L"End";
+        case VK_PRIOR: return L"Page Up";
+        case VK_NEXT: return L"Page Down";
+
+        case VK_F1: return L"F1";
+        case VK_F2: return L"F2";
+        case VK_F3: return L"F3";
+        case VK_F4: return L"F4";
+        case VK_F5: return L"F5";
+        case VK_F6: return L"F6";
+        case VK_F7: return L"F7";
+        case VK_F8: return L"F8";
+        case VK_F9: return L"F9";
+        case VK_F10: return L"F10";
+        case VK_F11: return L"F11";
+        case VK_F12: return L"F12";
+
+        case VK_NUMPAD0: return L"Num 0";
+        case VK_NUMPAD1: return L"Num 1";
+        case VK_NUMPAD2: return L"Num 2";
+        case VK_NUMPAD3: return L"Num 3";
+        case VK_NUMPAD4: return L"Num 4";
+        case VK_NUMPAD5: return L"Num 5";
+        case VK_NUMPAD6: return L"Num 6";
+        case VK_NUMPAD7: return L"Num 7";
+        case VK_NUMPAD8: return L"Num 8";
+        case VK_NUMPAD9: return L"Num 9";
     }
 
-    LeaveCriticalSection(
-        &dataLock
-    );
+    if ((vk >= 'A' && vk <= 'Z') ||
+        (vk >= '0' && vk <= '9'))
+    {
+        wchar_t buffer[2]{};
 
-    WriteInputsFile();
+        buffer[0] = static_cast<wchar_t>(vk);
 
-    InvalidateRect(
-        hwndOverlay,
-        nullptr,
-        FALSE
-    );
+        return buffer;
+    }
+
+    UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+
+    if (scanCode == 0)
+        return L"Unknown";
+
+    LONG lParam = static_cast<LONG>(scanCode << 16);
+
+    wchar_t name[128]{};
+
+    if (GetKeyNameTextW(lParam, name, 128) > 0)
+        return name;
+
+    return L"Unknown";
 }
 
 // ============================================================
@@ -557,64 +402,38 @@ static LRESULT CALLBACK KeyboardProc(
 {
     if (nCode == HC_ACTION)
     {
-        KBDLLHOOKSTRUCT* data =
-            reinterpret_cast<KBDLLHOOKSTRUCT*>(
-                lParam
-            );
+        const KBDLLHOOKSTRUCT* info =
+            reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
 
-        if (data)
+        if (info)
         {
-            DWORD vk =
-                data->vkCode;
+            DWORD vk = info->vkCode;
 
-            if (vk != VK_F8 &&
-                vk != VK_F9)
+            if (vk != VK_F8 && vk != VK_F9)
             {
-                // ------------------------------------------------
-                // KEY DOWN
-                // ------------------------------------------------
-
                 if (wParam == WM_KEYDOWN ||
                     wParam == WM_SYSKEYDOWN)
                 {
-                    std::wstring keyName =
-                        GetKeyName(vk);
+                    int& repeats = keyRepeatCounts[vk];
 
-                    // IMPORTANT:
-                    // keyRepeatCounts uses std::wstring keys.
-                    int& repeatCount =
-                        keyRepeatCounts[keyName];
-
-                    if (repeatCount <
-                        MAX_KEY_REPEATS)
+                    if (repeats < MAX_KEY_REPEATS)
                     {
-                        repeatCount++;
+                        repeats++;
 
                         RecordInput(
-                            keyName,
-                            true
+                            VirtualKeyToName(vk),
+                            false
                         );
                     }
                 }
-
-                // ------------------------------------------------
-                // KEY UP
-                // ------------------------------------------------
-
-                else if (
-                    wParam == WM_KEYUP ||
-                    wParam == WM_SYSKEYUP
-                )
+                else if (wParam == WM_KEYUP ||
+                         wParam == WM_SYSKEYUP)
                 {
-                    std::wstring keyName =
-                        GetKeyName(vk);
-
-                    keyRepeatCounts[keyName] =
-                        0;
+                    keyRepeatCounts[vk] = 0;
 
                     RecordInput(
-                        keyName,
-                        false
+                        VirtualKeyToName(vk),
+                        true
                     );
                 }
             }
@@ -630,30 +449,28 @@ static LRESULT CALLBACK KeyboardProc(
 }
 
 // ============================================================
-// MOUSE
+// MOUSE HOOK
 // ============================================================
 
-static std::wstring MouseName(
-    UINT message
-)
+static std::wstring MouseButtonName(DWORD message)
 {
     switch (message)
     {
-    case WM_LBUTTONDOWN:
-    case WM_LBUTTONUP:
-        return L"LMB";
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+            return L"LMB";
 
-    case WM_RBUTTONDOWN:
-    case WM_RBUTTONUP:
-        return L"RMB";
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP:
+            return L"RMB";
 
-    case WM_MBUTTONDOWN:
-    case WM_MBUTTONUP:
-        return L"MMB";
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+            return L"MMB";
 
-    case WM_XBUTTONDOWN:
-    case WM_XBUTTONUP:
-        return L"XMB";
+        case WM_XBUTTONDOWN:
+        case WM_XBUTTONUP:
+            return L"XMB";
     }
 
     return L"Mouse";
@@ -667,43 +484,62 @@ static LRESULT CALLBACK MouseProc(
 {
     if (nCode == HC_ACTION)
     {
-        MSLLHOOKSTRUCT* data =
-            reinterpret_cast<MSLLHOOKSTRUCT*>(
-                lParam
-            );
+        const MSLLHOOKSTRUCT* info =
+            reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
 
-        if (data)
+        if (info)
         {
-            bool down = false;
-            bool up = false;
-
             switch (wParam)
             {
-            case WM_LBUTTONDOWN:
-            case WM_RBUTTONDOWN:
-            case WM_MBUTTONDOWN:
-            case WM_XBUTTONDOWN:
-                down = true;
-                break;
+                case WM_LBUTTONDOWN:
+                case WM_RBUTTONDOWN:
+                case WM_MBUTTONDOWN:
+                    RecordInput(
+                        MouseButtonName(
+                            static_cast<DWORD>(wParam)
+                        ),
+                        false
+                    );
+                    break;
 
-            case WM_LBUTTONUP:
-            case WM_RBUTTONUP:
-            case WM_MBUTTONUP:
-            case WM_XBUTTONUP:
-                up = true;
-                break;
-            }
+                case WM_LBUTTONUP:
+                case WM_RBUTTONUP:
+                case WM_MBUTTONUP:
+                    RecordInput(
+                        MouseButtonName(
+                            static_cast<DWORD>(wParam)
+                        ),
+                        true
+                    );
+                    break;
 
-            if (down || up)
-            {
-                RecordInput(
-                    MouseName(
-                        static_cast<UINT>(
-                            wParam
-                        )
-                    ),
-                    down
-                );
+                case WM_XBUTTONDOWN:
+                {
+                    WORD button =
+                        HIWORD(info->mouseData);
+
+                    std::wstring name =
+                        (button == XBUTTON1)
+                        ? L"X1"
+                        : L"X2";
+
+                    RecordInput(name, false);
+                    break;
+                }
+
+                case WM_XBUTTONUP:
+                {
+                    WORD button =
+                        HIWORD(info->mouseData);
+
+                    std::wstring name =
+                        (button == XBUTTON1)
+                        ? L"X1"
+                        : L"X2";
+
+                    RecordInput(name, true);
+                    break;
+                }
             }
         }
     }
@@ -717,117 +553,52 @@ static LRESULT CALLBACK MouseProc(
 }
 
 // ============================================================
-// APM
+// TRAY
 // ============================================================
 
-static int GetCurrentAPM()
+static NOTIFYICONDATAW trayIcon{};
+
+static void AddTrayIcon()
 {
-    ULONGLONG now =
-        GetTickCount64();
+    ZeroMemory(&trayIcon, sizeof(trayIcon));
 
-    int count = 0;
+    trayIcon.cbSize = sizeof(trayIcon);
+    trayIcon.hWnd = hwndOverlay;
+    trayIcon.uID = 1;
+    trayIcon.uFlags =
+        NIF_MESSAGE |
+        NIF_ICON |
+        NIF_TIP;
 
-    EnterCriticalSection(
-        &dataLock
+    trayIcon.uCallbackMessage = WM_TRAYICON;
+    trayIcon.hIcon =
+        LoadIconW(nullptr, IDI_APPLICATION);
+
+    wcscpy_s(
+        trayIcon.szTip,
+        L"APM Overlay"
     );
 
-    for (auto it = actions.rbegin();
-         it != actions.rend();
-         ++it)
-    {
-        ULONGLONG age =
-            now - *it;
-
-        if (age <= 60000ULL)
-            count++;
-        else
-            break;
-    }
-
-    LeaveCriticalSection(
-        &dataLock
+    Shell_NotifyIconW(
+        NIM_ADD,
+        &trayIcon
     );
-
-    return count;
 }
 
-// ============================================================
-// TRAY MENU
-// ============================================================
-
-#define ID_TRAY 5000
-
-#define ID_TRAY_CLICKABLE 5001
-#define ID_TRAY_RESET_APM 5002
-#define ID_TRAY_RESET_INPUT 5003
-#define ID_TRAY_EXIT 5004
-
-static void UpdateWindowStyle()
+static void RemoveTrayIcon()
 {
-    LONG_PTR style =
-        GetWindowLongPtrW(
-            hwndOverlay,
-            GWL_STYLE
-        );
-
-    LONG_PTR exStyle =
-        GetWindowLongPtrW(
-            hwndOverlay,
-            GWL_EXSTYLE
-        );
-
-    if (clickableMode)
-    {
-        style |= WS_THICKFRAME;
-
-        exStyle &=
-            ~WS_EX_TRANSPARENT;
-    }
-    else
-    {
-        style &=
-            ~WS_THICKFRAME;
-
-        exStyle |=
-            WS_EX_TRANSPARENT;
-    }
-
-    SetWindowLongPtrW(
-        hwndOverlay,
-        GWL_STYLE,
-        style
-    );
-
-    SetWindowLongPtrW(
-        hwndOverlay,
-        GWL_EXSTYLE,
-        exStyle
-    );
-
-    SetWindowPos(
-        hwndOverlay,
-        HWND_TOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE |
-        SWP_NOSIZE |
-        SWP_NOACTIVATE |
-        SWP_FRAMECHANGED
-    );
-
-    InvalidateRect(
-        hwndOverlay,
-        nullptr,
-        TRUE
+    Shell_NotifyIconW(
+        NIM_DELETE,
+        &trayIcon
     );
 }
 
 static void ShowTrayMenu()
 {
-    HMENU menu =
-        CreatePopupMenu();
+    POINT pt{};
+    GetCursorPos(&pt);
+
+    HMENU menu = CreatePopupMenu();
 
     if (!menu)
         return;
@@ -835,9 +606,7 @@ static void ShowTrayMenu()
     AppendMenuW(
         menu,
         MF_STRING |
-        (clickableMode
-            ? MF_CHECKED
-            : 0),
+        (clickableMode ? MF_CHECKED : 0),
         ID_TRAY_CLICKABLE,
         clickableMode
             ? L"Pass-through Mode"
@@ -872,55 +641,96 @@ static void ShowTrayMenu()
         L"Exit"
     );
 
-    POINT point{};
-
-    GetCursorPos(
-        &point
-    );
-
-    SetForegroundWindow(
-        hwndOverlay
-    );
+    SetForegroundWindow(hwndOverlay);
 
     TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON,
-        point.x,
-        point.y,
+        pt.x,
+        pt.y,
         0,
         hwndOverlay,
         nullptr
-    );
-
-    PostMessageW(
-        hwndOverlay,
-        WM_NULL,
-        0,
-        0
     );
 
     DestroyMenu(menu);
 }
 
 // ============================================================
-// PAINT
+// CLICKABLE MODE
+// ============================================================
+
+static void ApplyWindowMode()
+{
+    LONG_PTR exStyle =
+        GetWindowLongPtrW(
+            hwndOverlay,
+            GWL_EXSTYLE
+        );
+
+    LONG_PTR style =
+        GetWindowLongPtrW(
+            hwndOverlay,
+            GWL_STYLE
+        );
+
+    if (clickableMode)
+    {
+        exStyle &= ~WS_EX_TRANSPARENT;
+
+        style |= WS_THICKFRAME;
+    }
+    else
+    {
+        exStyle |= WS_EX_TRANSPARENT;
+
+        style &= ~WS_THICKFRAME;
+    }
+
+    SetWindowLongPtrW(
+        hwndOverlay,
+        GWL_EXSTYLE,
+        exStyle
+    );
+
+    SetWindowLongPtrW(
+        hwndOverlay,
+        GWL_STYLE,
+        style
+    );
+
+    SetWindowPos(
+        hwndOverlay,
+        HWND_TOPMOST,
+        overlayX,
+        overlayY,
+        overlayWidth,
+        overlayHeight,
+        SWP_FRAMECHANGED |
+        SWP_SHOWWINDOW
+    );
+
+    InvalidateRect(
+        hwndOverlay,
+        nullptr,
+        TRUE
+    );
+}
+
+// ============================================================
+// DRAWING
 // ============================================================
 
 static void PaintOverlay(
+    HWND hwnd,
     HDC hdc
 )
 {
     RECT rc{};
-
-    GetClientRect(
-        hwndOverlay,
-        &rc
-    );
+    GetClientRect(hwnd, &rc);
 
     HBRUSH background =
-        CreateSolidBrush(
-            RGB(0, 0, 0)
-        );
+        CreateSolidBrush(RGB(0, 0, 0));
 
     FillRect(
         hdc,
@@ -928,16 +738,17 @@ static void PaintOverlay(
         background
     );
 
-    DeleteObject(
-        background
-    );
+    DeleteObject(background);
 
-    // White resize bar in clickable mode.
+    // White resize bar in clickable mode
     if (clickableMode)
     {
-        RECT bar = rc;
-
-        bar.bottom = 6;
+        RECT bar{
+            0,
+            0,
+            rc.right,
+            6
+        };
 
         HBRUSH white =
             CreateSolidBrush(
@@ -950,25 +761,25 @@ static void PaintOverlay(
             white
         );
 
-        DeleteObject(
-            white
-        );
+        DeleteObject(white);
     }
 
-    int apm =
-        GetCurrentAPM();
-
-    wchar_t text[64]{};
-
-    swprintf_s(
-        text,
-        L"APM %d",
-        apm
+    SetBkMode(
+        hdc,
+        TRANSPARENT
     );
+
+    SetTextColor(
+        hdc,
+        RGB(255, 255, 255)
+    );
+
+    int fontHeight =
+        max(16, rc.bottom - 14);
 
     HFONT font =
         CreateFontW(
-            -28,
+            -fontHeight,
             0,
             0,
             0,
@@ -992,20 +803,20 @@ static void PaintOverlay(
             )
         );
 
-    SetBkMode(
-        hdc,
-        TRANSPARENT
+    wchar_t text[64];
+
+    swprintf_s(
+        text,
+        L"APM %d",
+        GetCurrentAPM()
     );
 
-    SetTextColor(
-        hdc,
-        RGB(255, 255, 255)
-    );
-
-    RECT textRect = rc;
-
-    if (clickableMode)
-        textRect.top += 6;
+    RECT textRect{
+        0,
+        clickableMode ? 6 : 0,
+        rc.right,
+        rc.bottom
+    };
 
     DrawTextW(
         hdc,
@@ -1022,9 +833,7 @@ static void PaintOverlay(
         oldFont
     );
 
-    DeleteObject(
-        font
-    );
+    DeleteObject(font);
 }
 
 // ============================================================
@@ -1033,232 +842,282 @@ static void PaintOverlay(
 
 static LRESULT CALLBACK WindowProc(
     HWND hwnd,
-    UINT message,
+    UINT msg,
     WPARAM wParam,
     LPARAM lParam
 )
 {
-    switch (message)
+    switch (msg)
     {
-    case WM_CREATE:
-    {
-        SetTimer(
-            hwnd,
-            REFRESH_TIMER,
-            REFRESH_MS,
-            nullptr
-        );
-
-        return 0;
-    }
-
-    case WM_TIMER:
-    {
-        if (wParam == REFRESH_TIMER)
+        case WM_PAINT:
         {
-            InvalidateRect(
+            PAINTSTRUCT ps{};
+
+            HDC hdc =
+                BeginPaint(
+                    hwnd,
+                    &ps
+                );
+
+            PaintOverlay(
                 hwnd,
-                nullptr,
-                FALSE
+                hdc
             );
-        }
 
-        return 0;
-    }
-
-    case WM_COMMAND:
-    {
-        switch (LOWORD(wParam))
-        {
-        case ID_TRAY_CLICKABLE:
-        {
-            clickableMode =
-                !clickableMode;
-
-            UpdateWindowStyle();
-
-            return 0;
-        }
-
-        case ID_TRAY_RESET_APM:
-        {
-            ResetAPM();
-
-            return 0;
-        }
-
-        case ID_TRAY_RESET_INPUT:
-        {
-            ResetInputTracker();
-
-            return 0;
-        }
-
-        case ID_TRAY_EXIT:
-        {
-            DestroyWindow(hwnd);
-
-            return 0;
-        }
-        }
-
-        break;
-    }
-
-    case WM_NCHITTEST:
-    {
-        if (!clickableMode)
-            return HTTRANSPARENT;
-
-        POINT pt =
-        {
-            GET_X_LPARAM(lParam),
-            GET_Y_LPARAM(lParam)
-        };
-
-        ScreenToClient(
-            hwnd,
-            &pt
-        );
-
-        RECT rc{};
-
-        GetClientRect(
-            hwnd,
-            &rc
-        );
-
-        const int grip = 8;
-
-        bool left =
-            pt.x < grip;
-
-        bool right =
-            pt.x >= rc.right - grip;
-
-        bool top =
-            pt.y < grip;
-
-        bool bottom =
-            pt.y >= rc.bottom - grip;
-
-        if (top && left)
-            return HTTOPLEFT;
-
-        if (top && right)
-            return HTTOPRIGHT;
-
-        if (bottom && left)
-            return HTBOTTOMLEFT;
-
-        if (bottom && right)
-            return HTBOTTOMRIGHT;
-
-        if (top)
-            return HTTOP;
-
-        if (bottom)
-            return HTBOTTOM;
-
-        if (left)
-            return HTLEFT;
-
-        if (right)
-            return HTRIGHT;
-
-        return HTCAPTION;
-    }
-
-    case WM_SIZE:
-    case WM_MOVE:
-    {
-        SaveWindowSettings();
-
-        break;
-    }
-
-    case WM_PAINT:
-    {
-        PAINTSTRUCT ps{};
-
-        HDC hdc =
-            BeginPaint(
+            EndPaint(
                 hwnd,
                 &ps
             );
 
-        PaintOverlay(
-            hdc
-        );
-
-        EndPaint(
-            hwnd,
-            &ps
-        );
-
-        return 0;
-    }
-
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_RBUTTONUP:
-    {
-        ShowTrayMenu();
-
-        return 0;
-    }
-
-    case WM_CLOSE:
-    {
-        SaveWindowSettings();
-
-        DestroyWindow(
-            hwnd
-        );
-
-        return 0;
-    }
-
-    case WM_DESTROY:
-    {
-        KillTimer(
-            hwnd,
-            REFRESH_TIMER
-        );
-
-        if (keyboardHook)
-        {
-            UnhookWindowsHookEx(
-                keyboardHook
-            );
-
-            keyboardHook = nullptr;
+            return 0;
         }
 
-        if (mouseHook)
-        {
-            UnhookWindowsHookEx(
-                mouseHook
-            );
+        case WM_ERASEBKGND:
+            return 1;
 
-            mouseHook = nullptr;
+        case WM_TIMER:
+        {
+            if (wParam == TIMER_REFRESH)
+            {
+                InvalidateRect(
+                    hwnd,
+                    nullptr,
+                    TRUE
+                );
+            }
+
+            return 0;
         }
 
-        Shell_NotifyIconW(
-            NIM_DELETE,
-            &nid
-        );
+        case WM_MOVING:
+        {
+            RECT* r =
+                reinterpret_cast<RECT*>(lParam);
 
-        PostQuitMessage(0);
+            if (r)
+            {
+                overlayX = r->left;
+                overlayY = r->top;
+            }
 
-        return 0;
-    }
+            return TRUE;
+        }
+
+        case WM_SIZING:
+        {
+            RECT* r =
+                reinterpret_cast<RECT*>(lParam);
+
+            if (r)
+            {
+                overlayWidth =
+                    r->right - r->left;
+
+                overlayHeight =
+                    r->bottom - r->top;
+            }
+
+            return TRUE;
+        }
+
+        case WM_EXITSIZEMOVE:
+        {
+            RECT r{};
+
+            GetWindowRect(
+                hwnd,
+                &r
+            );
+
+            overlayX = r.left;
+            overlayY = r.top;
+
+            overlayWidth =
+                r.right - r.left;
+
+            overlayHeight =
+                r.bottom - r.top;
+
+            SaveSettings();
+
+            return 0;
+        }
+
+        case WM_NCHITTEST:
+        {
+            if (!clickableMode)
+                return HTTRANSPARENT;
+
+            POINT pt{
+                GET_X_LPARAM(lParam),
+                GET_Y_LPARAM(lParam)
+            };
+
+            ScreenToClient(
+                hwnd,
+                &pt
+            );
+
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+
+            const int grip = 8;
+
+            bool left = pt.x < grip;
+            bool right = pt.x >= rc.right - grip;
+            bool top = pt.y < grip;
+            bool bottom = pt.y >= rc.bottom - grip;
+
+            if (top && left)
+                return HTTOPLEFT;
+
+            if (top && right)
+                return HTTOPRIGHT;
+
+            if (bottom && left)
+                return HTBOTTOMLEFT;
+
+            if (bottom && right)
+                return HTBOTTOMRIGHT;
+
+            if (left)
+                return HTLEFT;
+
+            if (right)
+                return HTRIGHT;
+
+            if (top)
+                return HTTOP;
+
+            if (bottom)
+                return HTBOTTOM;
+
+            return HTCAPTION;
+        }
+
+        case WM_COMMAND:
+        {
+            switch (LOWORD(wParam))
+            {
+                case ID_TRAY_CLICKABLE:
+                {
+                    RECT r{};
+
+                    GetWindowRect(
+                        hwnd,
+                        &r
+                    );
+
+                    overlayX = r.left;
+                    overlayY = r.top;
+
+                    overlayWidth =
+                        r.right - r.left;
+
+                    overlayHeight =
+                        r.bottom - r.top;
+
+                    clickableMode =
+                        !clickableMode;
+
+                    ApplyWindowMode();
+
+                    SaveSettings();
+
+                    return 0;
+                }
+
+                case ID_TRAY_RESET_APM:
+                    ResetAPM();
+                    return 0;
+
+                case ID_TRAY_RESET_INPUT:
+                    ResetInputTracker();
+                    return 0;
+
+                case ID_TRAY_EXIT:
+                    DestroyWindow(hwnd);
+                    return 0;
+            }
+
+            break;
+        }
+
+        case WM_TRAYICON:
+        {
+            if (lParam == WM_RBUTTONUP)
+            {
+                ShowTrayMenu();
+                return 0;
+            }
+
+            if (lParam == WM_LBUTTONDBLCLK)
+            {
+                clickableMode =
+                    !clickableMode;
+
+                ApplyWindowMode();
+
+                return 0;
+            }
+
+            break;
+        }
+
+        case WM_DESTROY:
+        {
+            RECT r{};
+
+            GetWindowRect(
+                hwnd,
+                &r
+            );
+
+            overlayX = r.left;
+            overlayY = r.top;
+
+            overlayWidth =
+                r.right - r.left;
+
+            overlayHeight =
+                r.bottom - r.top;
+
+            SaveSettings();
+
+            RemoveTrayIcon();
+
+            if (keyboardHook)
+            {
+                UnhookWindowsHookEx(
+                    keyboardHook
+                );
+
+                keyboardHook = nullptr;
+            }
+
+            if (mouseHook)
+            {
+                UnhookWindowsHookEx(
+                    mouseHook
+                );
+
+                mouseHook = nullptr;
+            }
+
+            KillTimer(
+                hwnd,
+                TIMER_REFRESH
+            );
+
+            PostQuitMessage(0);
+
+            return 0;
+        }
     }
 
     return DefWindowProcW(
         hwnd,
-        message,
+        msg,
         wParam,
         lParam
     );
@@ -1276,52 +1135,40 @@ int WINAPI wWinMain(
 )
 {
     InitializeCriticalSection(
-        &dataLock
+        &actionLock
     );
 
-    LoadWindowSettings();
+    LoadSettings();
 
-    WNDCLASSEXW wc{};
-
-    wc.cbSize =
-        sizeof(WNDCLASSEXW);
-
-    wc.hInstance =
-        hInstance;
+    WNDCLASSW wc{};
 
     wc.lpfnWndProc =
         WindowProc;
+
+    wc.hInstance =
+        hInstance;
 
     wc.lpszClassName =
         L"APMOverlayWindow";
 
     wc.hCursor =
-        LoadCursor(
+        LoadCursorW(
             nullptr,
             IDC_ARROW
         );
 
     wc.hbrBackground =
         static_cast<HBRUSH>(
-            GetStockObject(
-                BLACK_BRUSH
-            )
+            GetStockObject(BLACK_BRUSH)
         );
 
-    if (!RegisterClassExW(&wc))
-    {
-        DeleteCriticalSection(
-            &dataLock
-        );
-
-        return 1;
-    }
+    RegisterClassW(&wc);
 
     DWORD exStyle =
         WS_EX_LAYERED |
+        WS_EX_TRANSPARENT |
         WS_EX_TOPMOST |
         WS_EX_TOOLWINDOW |
-        WS_EX_TRANSPARENT |
         WS_EX_NOACTIVATE;
 
     DWORD style =
@@ -1331,7 +1178,7 @@ int WINAPI wWinMain(
         CreateWindowExW(
             exStyle,
             wc.lpszClassName,
-            APP_NAME,
+            L"APM Overlay",
             style,
             overlayX,
             overlayY,
@@ -1346,7 +1193,7 @@ int WINAPI wWinMain(
     if (!hwndOverlay)
     {
         DeleteCriticalSection(
-            &dataLock
+            &actionLock
         );
 
         return 1;
@@ -1359,57 +1206,27 @@ int WINAPI wWinMain(
         LWA_COLORKEY
     );
 
-    // ========================================================
-    // TRAY ICON
-    // ========================================================
-
-    ZeroMemory(
-        &nid,
-        sizeof(nid)
+    ShowWindow(
+        hwndOverlay,
+        SW_SHOWNOACTIVATE
     );
 
-    nid.cbSize =
-        sizeof(nid);
+    UpdateWindow(hwndOverlay);
 
-    nid.hWnd =
-        hwndOverlay;
+    AddTrayIcon();
 
-    nid.uID =
-        ID_TRAY;
-
-    nid.uFlags =
-        NIF_ICON |
-        NIF_MESSAGE |
-        NIF_TIP;
-
-    nid.uCallbackMessage =
-        WM_USER + 1;
-
-    nid.hIcon =
-        LoadIcon(
-            nullptr,
-            IDI_APPLICATION
-        );
-
-    wcscpy_s(
-        nid.szTip,
-        L"APM Overlay"
+    SetTimer(
+        hwndOverlay,
+        TIMER_REFRESH,
+        REFRESH_MS,
+        nullptr
     );
-
-    Shell_NotifyIconW(
-        NIM_ADD,
-        &nid
-    );
-
-    // ========================================================
-    // HOOKS
-    // ========================================================
 
     keyboardHook =
         SetWindowsHookExW(
             WH_KEYBOARD_LL,
             KeyboardProc,
-            nullptr,
+            hInstance,
             0
         );
 
@@ -1417,55 +1234,11 @@ int WINAPI wWinMain(
         SetWindowsHookExW(
             WH_MOUSE_LL,
             MouseProc,
-            nullptr,
+            hInstance,
             0
         );
 
-    if (!keyboardHook ||
-        !mouseHook)
-    {
-        if (keyboardHook)
-        {
-            UnhookWindowsHookEx(
-                keyboardHook
-            );
-        }
-
-        if (mouseHook)
-        {
-            UnhookWindowsHookEx(
-                mouseHook
-            );
-        }
-
-        Shell_NotifyIconW(
-            NIM_DELETE,
-            &nid
-        );
-
-        DestroyWindow(
-            hwndOverlay
-        );
-
-        DeleteCriticalSection(
-            &dataLock
-        );
-
-        return 1;
-    }
-
-    ShowWindow(
-        hwndOverlay,
-        SW_SHOW
-    );
-
-    UpdateWindow(
-        hwndOverlay
-    );
-
-    // ========================================================
-    // MESSAGE LOOP
-    // ========================================================
+    SaveInputsFile();
 
     MSG msg{};
 
@@ -1476,30 +1249,15 @@ int WINAPI wWinMain(
         0
     ) > 0)
     {
-        if (msg.message ==
-            WM_USER + 1 &&
-            msg.hwnd ==
-            hwndOverlay)
-        {
-            if (msg.lParam ==
-                WM_RBUTTONUP)
-            {
-                ShowTrayMenu();
-            }
-        }
-
-        TranslateMessage(
-            &msg
-        );
-
-        DispatchMessageW(
-            &msg
-        );
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     DeleteCriticalSection(
-        &dataLock
+        &actionLock
     );
 
-    return 0;
+    return static_cast<int>(
+        msg.wParam
+    );
 }
