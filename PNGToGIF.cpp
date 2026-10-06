@@ -5,1337 +5,41 @@
 
 #include <windows.h>
 #include <windowsx.h>
-#include <objbase.h>
+#include <shlwapi.h>
 #include <wincodec.h>
+#include <commdlg.h>
 
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <sstream>
-#include <cwctype>
-#include <cmath>
-#include <cstring>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
-
-// ============================================================
-// SETTINGS
-// ============================================================
-
-static const int VIDEO_WIDTH  = 1920;
-static const int VIDEO_HEIGHT = 1080;
-static const int FPS = 60;
-
-static const int DEFAULT_WIDTH  = 1100;
-static const int DEFAULT_HEIGHT = 850;
-
-static const UINT TIMER_PREVIEW = 1;
-
-// ============================================================
-// EVENT
-// ============================================================
-
-struct TimelineEvent
-{
-    double time = 0.0;
-    std::wstring name;
-    bool down = true;
-};
+#pragma comment(lib, "shlwapi.lib")
 
 // ============================================================
 // GLOBALS
 // ============================================================
 
-static HWND hwndMain = nullptr;
-static HWND hwndTimeline = nullptr;
-static HWND hwndLoad = nullptr;
-static HWND hwndPlay = nullptr;
-static HWND hwndReset = nullptr;
-static HWND hwndExportPNG = nullptr;
+static HWND g_hWnd = nullptr;
+static HWND g_hFolder = nullptr;
+static HWND g_hFPS = nullptr;
+static HWND g_hOutput = nullptr;
+static HWND g_hConvert = nullptr;
+static HWND g_hStatus = nullptr;
 
-static std::vector<TimelineEvent> events;
-static std::vector<std::wstring> heldKeys;
-
-static size_t processedEventIndex = 0;
-
-static double currentTime = 0.0;
-static double duration = 0.0;
-
-static bool playing = false;
-
-static LARGE_INTEGER performanceFrequency{};
-static LARGE_INTEGER lastPerformanceTime{};
+static std::wstring g_folder;
+static std::wstring g_output;
 
 // ============================================================
-// STRING HELPERS
+// HELPERS
 // ============================================================
 
-static std::wstring Trim(const std::wstring& input)
-{
-    size_t first = 0;
-
-    while (
-        first < input.size() &&
-        iswspace(input[first])
-    )
-    {
-        ++first;
-    }
-
-    size_t last = input.size();
-
-    while (
-        last > first &&
-        iswspace(input[last - 1])
-    )
-    {
-        --last;
-    }
-
-    return input.substr(
-        first,
-        last - first
-    );
-}
-
-static std::wstring ToUpper(std::wstring value)
-{
-    for (wchar_t& c : value)
-        c = towupper(c);
-
-    return value;
-}
-
-static bool EndsWith(
-    const std::wstring& value,
-    const std::wstring& ending
-)
-{
-    if (value.size() < ending.size())
-        return false;
-
-    return value.compare(
-        value.size() - ending.size(),
-        ending.size(),
-        ending
-    ) == 0;
-}
-
-// ============================================================
-// TIMESTAMP PARSER
-// ============================================================
-
-static bool ParseTimestamp(
-    const std::wstring& text,
-    double& seconds
-)
-{
-    std::wstring s = Trim(text);
-
-    for (wchar_t& c : s)
-    {
-        if (c == L':')
-            c = L' ';
-    }
-
-    std::wstringstream ss(s);
-
-    int hour = 0;
-    int minute = 0;
-    double second = 0.0;
-    std::wstring ampm;
-
-    if (!(ss >> hour >> minute >> second >> ampm))
-        return false;
-
-    ampm = ToUpper(ampm);
-
-    if (
-        ampm != L"AM" &&
-        ampm != L"PM"
-    )
-    {
-        return false;
-    }
-
-    if (hour < 1 || hour > 12)
-        return false;
-
-    if (minute < 0 || minute > 59)
-        return false;
-
-    if (second < 0.0 || second >= 60.0)
-        return false;
-
-    if (ampm == L"AM")
-    {
-        if (hour == 12)
-            hour = 0;
-    }
-    else
-    {
-        if (hour != 12)
-            hour += 12;
-    }
-
-    seconds =
-        static_cast<double>(hour) * 3600.0 +
-        static_cast<double>(minute) * 60.0 +
-        second;
-
-    return true;
-}
-
-// ============================================================
-// TIMELINE PARSER
-// ============================================================
-
-static bool ParseTimeline(
-    const std::wstring& text
-)
-{
-    std::vector<TimelineEvent> parsed;
-
-    std::wstringstream stream(text);
-    std::wstring line;
-
-    double previousClock = -1.0;
-    double dayOffset = 0.0;
-
-    while (std::getline(stream, line))
-    {
-        line = Trim(line);
-
-        if (line.empty())
-            continue;
-
-        if (line[0] == L'#')
-            continue;
-
-        std::wstring timestampText;
-        std::wstring inputName;
-
-        size_t tab =
-            line.find(L'\t');
-
-        if (tab != std::wstring::npos)
-        {
-            timestampText =
-                Trim(line.substr(0, tab));
-
-            inputName =
-                Trim(line.substr(tab + 1));
-        }
-        else
-        {
-            std::wstring upper =
-                ToUpper(line);
-
-            size_t amPos =
-                upper.find(L" AM");
-
-            size_t pmPos =
-                upper.find(L" PM");
-
-            size_t pos =
-                std::wstring::npos;
-
-            if (amPos != std::wstring::npos)
-                pos = amPos;
-
-            if (
-                pmPos != std::wstring::npos &&
-                (
-                    pos == std::wstring::npos ||
-                    pmPos < pos
-                )
-            )
-            {
-                pos = pmPos;
-            }
-
-            if (pos == std::wstring::npos)
-                continue;
-
-            size_t timestampEnd =
-                pos + 3;
-
-            timestampText =
-                Trim(
-                    line.substr(
-                        0,
-                        timestampEnd
-                    )
-                );
-
-            inputName =
-                Trim(
-                    line.substr(
-                        timestampEnd
-                    )
-                );
-        }
-
-        if (
-            timestampText.empty() ||
-            inputName.empty()
-        )
-        {
-            continue;
-        }
-
-        double clockSeconds = 0.0;
-
-        if (
-            !ParseTimestamp(
-                timestampText,
-                clockSeconds
-            )
-        )
-        {
-            continue;
-        }
-
-        if (
-            previousClock >= 0.0 &&
-            clockSeconds < previousClock
-        )
-        {
-            dayOffset += 86400.0;
-        }
-
-        previousClock = clockSeconds;
-
-        TimelineEvent event;
-
-        event.time =
-            clockSeconds + dayOffset;
-
-        event.name =
-            inputName;
-
-        if (
-            EndsWith(
-                event.name,
-                L"_UP"
-            )
-        )
-        {
-            event.down = false;
-
-            event.name.resize(
-                event.name.size() - 3
-            );
-
-            event.name =
-                Trim(event.name);
-        }
-        else
-        {
-            event.down = true;
-        }
-
-        parsed.push_back(event);
-    }
-
-    if (parsed.empty())
-        return false;
-
-    double firstTime =
-        parsed.front().time;
-
-    for (TimelineEvent& event : parsed)
-    {
-        event.time -= firstTime;
-
-        if (event.time < 0.0)
-            event.time = 0.0;
-    }
-
-    std::stable_sort(
-        parsed.begin(),
-        parsed.end(),
-        [](const TimelineEvent& a,
-           const TimelineEvent& b)
-        {
-            return a.time < b.time;
-        }
-    );
-
-    events = parsed;
-
-    duration =
-        events.back().time + 0.5;
-
-    if (duration < 0.5)
-        duration = 0.5;
-
-    currentTime = 0.0;
-    processedEventIndex = 0;
-    heldKeys.clear();
-
-    return true;
-}
-
-// ============================================================
-// EDIT CONTROL
-// ============================================================
-
-static std::wstring GetEditText(HWND edit)
-{
-    int length =
-        GetWindowTextLengthW(edit);
-
-    if (length <= 0)
-        return L"";
-
-    std::wstring text(
-        static_cast<size_t>(length) + 1,
-        L'\0'
-    );
-
-    GetWindowTextW(
-        edit,
-        &text[0],
-        length + 1
-    );
-
-    text.resize(
-        static_cast<size_t>(length)
-    );
-
-    return text;
-}
-
-// ============================================================
-// HELD STATE
-// ============================================================
-
-static bool IsHeld(
-    const std::wstring& name
-)
-{
-    return std::find(
-        heldKeys.begin(),
-        heldKeys.end(),
-        name
-    ) != heldKeys.end();
-}
-
-static void SetHeld(
-    const std::wstring& name,
-    bool held
-)
-{
-    auto it =
-        std::find(
-            heldKeys.begin(),
-            heldKeys.end(),
-            name
-        );
-
-    if (held)
-    {
-        if (it == heldKeys.end())
-            heldKeys.push_back(name);
-    }
-    else
-    {
-        if (it != heldKeys.end())
-            heldKeys.erase(it);
-    }
-}
-
-// ============================================================
-// PLAYBACK
-// ============================================================
-
-static void ResetPlaybackState()
-{
-    heldKeys.clear();
-    processedEventIndex = 0;
-}
-
-static void ProcessEventsTo(
-    double targetTime
-)
-{
-    while (
-        processedEventIndex < events.size() &&
-        events[processedEventIndex].time <= targetTime
-    )
-    {
-        const TimelineEvent& event =
-            events[processedEventIndex];
-
-        SetHeld(
-            event.name,
-            event.down
-        );
-
-        ++processedEventIndex;
-    }
-}
-
-// ============================================================
-// APM
-// ============================================================
-
-static int CalculateAPM(double time)
-{
-    double start =
-        time - 60.0;
-
-    int count = 0;
-
-    for (const TimelineEvent& event : events)
-    {
-        if (!event.down)
-            continue;
-
-        if (event.time > time)
-            break;
-
-        if (event.time >= start)
-            ++count;
-    }
-
-    return count;
-}
-
-// ============================================================
-// DRAW HELPERS
-// ============================================================
-
-static void FillRectColor(
-    HDC hdc,
-    int left,
-    int top,
-    int right,
-    int bottom,
-    COLORREF color
-)
-{
-    RECT r{
-        left,
-        top,
-        right,
-        bottom
-    };
-
-    HBRUSH brush =
-        CreateSolidBrush(color);
-
-    FillRect(
-        hdc,
-        &r,
-        brush
-    );
-
-    DeleteObject(brush);
-}
-
-static void DrawCenteredText(
-    HDC hdc,
-    const std::wstring& text,
-    int left,
-    int top,
-    int right,
-    int bottom,
-    int fontSize,
-    bool bold
-)
-{
-    HFONT font =
-        CreateFontW(
-            -fontSize,
-            0,
-            0,
-            0,
-            bold ? FW_BOLD : FW_NORMAL,
-            FALSE,
-            FALSE,
-            FALSE,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            DEFAULT_PITCH | FF_DONTCARE,
-            L"Arial"
-        );
-
-    HFONT old =
-        static_cast<HFONT>(
-            SelectObject(
-                hdc,
-                font
-            )
-        );
-
-    SetBkMode(
-        hdc,
-        TRANSPARENT
-    );
-
-    SetTextColor(
-        hdc,
-        RGB(255, 255, 255)
-    );
-
-    RECT r{
-        left,
-        top,
-        right,
-        bottom
-    };
-
-    DrawTextW(
-        hdc,
-        text.c_str(),
-        -1,
-        &r,
-        DT_CENTER |
-        DT_VCENTER |
-        DT_SINGLELINE
-    );
-
-    SelectObject(
-        hdc,
-        old
-    );
-
-    DeleteObject(font);
-}
-
-// ============================================================
-// KEY DRAWING
-// ============================================================
-
-static void DrawKey(
-    HDC hdc,
-    const std::wstring& name,
-    int x,
-    int y,
-    int width,
-    int height,
-    int fontSize = 18
-)
-{
-    bool pressed =
-        IsHeld(name);
-
-    COLORREF background =
-        pressed
-            ? RGB(255, 170, 40)
-            : RGB(55, 55, 60);
-
-    FillRectColor(
-        hdc,
-        x,
-        y,
-        x + width,
-        y + height,
-        background
-    );
-
-    HPEN pen =
-        CreatePen(
-            PS_SOLID,
-            2,
-            RGB(100, 100, 105)
-        );
-
-    HGDIOBJ oldPen =
-        SelectObject(
-            hdc,
-            pen
-        );
-
-    HGDIOBJ oldBrush =
-        SelectObject(
-            hdc,
-            GetStockObject(NULL_BRUSH)
-        );
-
-    Rectangle(
-        hdc,
-        x,
-        y,
-        x + width,
-        y + height
-    );
-
-    SelectObject(
-        hdc,
-        oldBrush
-    );
-
-    SelectObject(
-        hdc,
-        oldPen
-    );
-
-    DeleteObject(pen);
-
-    DrawCenteredText(
-        hdc,
-        name,
-        x,
-        y,
-        x + width,
-        y + height,
-        fontSize,
-        true
-    );
-}
-
-// ============================================================
-// KEYBOARD
-// ============================================================
-
-static void DrawKeyboard(HDC hdc)
-{
-    const int keyW = 70;
-    const int keyH = 62;
-    const int gap = 8;
-
-    const int startX = 300;
-    const int startY = 390;
-
-    const wchar_t* numbers[] =
-    {
-        L"1", L"2", L"3", L"4", L"5",
-        L"6", L"7", L"8", L"9", L"0"
-    };
-
-    for (int i = 0; i < 10; ++i)
-    {
-        DrawKey(
-            hdc,
-            numbers[i],
-            startX + i * (keyW + gap),
-            startY,
-            keyW,
-            keyH
-        );
-    }
-
-    const wchar_t* qrow[] =
-    {
-        L"Q", L"W", L"E", L"R", L"T",
-        L"Y", L"U", L"I", L"O", L"P"
-    };
-
-    for (int i = 0; i < 10; ++i)
-    {
-        DrawKey(
-            hdc,
-            qrow[i],
-            startX + 30 + i * (keyW + gap),
-            startY + keyH + gap,
-            keyW,
-            keyH
-        );
-    }
-
-    const wchar_t* arow[] =
-    {
-        L"A", L"S", L"D", L"F", L"G",
-        L"H", L"J", L"K", L"L"
-    };
-
-    for (int i = 0; i < 9; ++i)
-    {
-        DrawKey(
-            hdc,
-            arow[i],
-            startX + 65 + i * (keyW + gap),
-            startY + 2 * (keyH + gap),
-            keyW,
-            keyH
-        );
-    }
-
-    const wchar_t* zrow[] =
-    {
-        L"Z", L"X", L"C", L"V", L"B",
-        L"N", L"M"
-    };
-
-    for (int i = 0; i < 7; ++i)
-    {
-        DrawKey(
-            hdc,
-            zrow[i],
-            startX + 105 + i * (keyW + gap),
-            startY + 3 * (keyH + gap),
-            keyW,
-            keyH
-        );
-    }
-
-    DrawKey(
-        hdc,
-        L"Space",
-        startX + 180,
-        startY + 4 * (keyH + gap),
-        500,
-        keyH
-    );
-
-    DrawKey(
-        hdc,
-        L"Left Ctrl",
-        startX - 110,
-        startY + 4 * (keyH + gap),
-        110,
-        keyH,
-        15
-    );
-
-    DrawKey(
-        hdc,
-        L"Left Shift",
-        startX - 30,
-        startY + 3 * (keyH + gap),
-        125,
-        keyH,
-        15
-    );
-
-    DrawKey(
-        hdc,
-        L"Left Alt",
-        startX + 55,
-        startY + 4 * (keyH + gap),
-        110,
-        keyH,
-        15
-    );
-
-    DrawKey(
-        hdc,
-        L"Enter",
-        startX + 9 * (keyW + gap) - 15,
-        startY + 2 * (keyH + gap),
-        125,
-        keyH,
-        16
-    );
-}
-
-// ============================================================
-// MOUSE
-// ============================================================
-
-static void DrawMouse(HDC hdc)
-{
-    const int x = 1250;
-    const int y = 430;
-
-    bool left =
-        IsHeld(L"LMB");
-
-    bool right =
-        IsHeld(L"RMB");
-
-    FillRectColor(
-        hdc,
-        x,
-        y,
-        x + 250,
-        y + 330,
-        RGB(45, 45, 50)
-    );
-
-    HPEN pen =
-        CreatePen(
-            PS_SOLID,
-            4,
-            RGB(120, 120, 125)
-        );
-
-    HGDIOBJ oldPen =
-        SelectObject(
-            hdc,
-            pen
-        );
-
-    HGDIOBJ oldBrush =
-        SelectObject(
-            hdc,
-            GetStockObject(NULL_BRUSH)
-        );
-
-    RoundRect(
-        hdc,
-        x,
-        y,
-        x + 250,
-        y + 330,
-        70,
-        70
-    );
-
-    SelectObject(
-        hdc,
-        oldBrush
-    );
-
-    SelectObject(
-        hdc,
-        oldPen
-    );
-
-    DeleteObject(pen);
-
-    FillRectColor(
-        hdc,
-        x + 15,
-        y + 15,
-        x + 118,
-        y + 155,
-        left
-            ? RGB(255, 170, 40)
-            : RGB(70, 70, 75)
-    );
-
-    FillRectColor(
-        hdc,
-        x + 132,
-        y + 15,
-        x + 235,
-        y + 155,
-        right
-            ? RGB(255, 170, 40)
-            : RGB(70, 70, 75)
-    );
-
-    DrawCenteredText(
-        hdc,
-        L"LMB",
-        x + 15,
-        y + 30,
-        x + 118,
-        y + 140,
-        25,
-        true
-    );
-
-    DrawCenteredText(
-        hdc,
-        L"RMB",
-        x + 132,
-        y + 30,
-        x + 235,
-        y + 140,
-        25,
-        true
-    );
-
-    DrawCenteredText(
-        hdc,
-        L"MOUSE",
-        x,
-        y + 180,
-        x + 250,
-        y + 240,
-        24,
-        true
-    );
-}
-
-// ============================================================
-// SCENE
-// ============================================================
-
-static void RenderScene(
-    HDC hdc,
-    int width,
-    int height
-)
-{
-    FillRectColor(
-        hdc,
-        0,
-        0,
-        width,
-        height,
-        RGB(18, 18, 22)
-    );
-
-    int apm =
-        CalculateAPM(currentTime);
-
-    wchar_t apmText[64]{};
-
-    swprintf_s(
-        apmText,
-        L"APM %d",
-        apm
-    );
-
-    DrawCenteredText(
-        hdc,
-        apmText,
-        0,
-        50,
-        width,
-        160,
-        70,
-        true
-    );
-
-    wchar_t timeText[64]{};
-
-    swprintf_s(
-        timeText,
-        L"%02d:%05.2f",
-        static_cast<int>(currentTime / 60.0),
-        fmod(currentTime, 60.0)
-    );
-
-    DrawCenteredText(
-        hdc,
-        timeText,
-        0,
-        165,
-        width,
-        215,
-        26,
-        false
-    );
-
-    DrawKeyboard(hdc);
-    DrawMouse(hdc);
-
-    const int barX = 250;
-    const int barY = 920;
-    const int barW = 1420;
-    const int barH = 18;
-
-    FillRectColor(
-        hdc,
-        barX,
-        barY,
-        barX + barW,
-        barY + barH,
-        RGB(50, 50, 55)
-    );
-
-    double progress =
-        duration > 0.0
-            ? currentTime / duration
-            : 0.0;
-
-    progress =
-        std::max(
-            0.0,
-            std::min(
-                1.0,
-                progress
-            )
-        );
-
-    FillRectColor(
-        hdc,
-        barX,
-        barY,
-        barX +
-            static_cast<int>(
-                barW * progress
-            ),
-        barY + barH,
-        RGB(255, 170, 40)
-    );
-}
-
-// ============================================================
-// LOAD
-// ============================================================
-
-static void LoadTimelineFromEditor()
-{
-    std::wstring text =
-        GetEditText(hwndTimeline);
-
-    if (!ParseTimeline(text))
-    {
-        MessageBoxW(
-            hwndMain,
-            L"No valid timeline events were found.\n\n"
-            L"Example:\n"
-            L"10:46:46.533 PM\t1\n"
-            L"10:46:46.638 PM\t2\n"
-            L"10:46:46.654 PM\t1_UP",
-            L"Timeline Error",
-            MB_OK |
-            MB_ICONWARNING
-        );
-
-        return;
-    }
-
-    playing = false;
-
-    SetWindowTextW(
-        hwndPlay,
-        L"Play"
-    );
-
-    InvalidateRect(
-        hwndMain,
-        nullptr,
-        TRUE
-    );
-}
-
-// ============================================================
-// RESET
-// ============================================================
-
-static void ResetVisualizer()
-{
-    playing = false;
-
-    currentTime = 0.0;
-
-    ResetPlaybackState();
-
-    SetWindowTextW(
-        hwndPlay,
-        L"Play"
-    );
-
-    InvalidateRect(
-        hwndMain,
-        nullptr,
-        TRUE
-    );
-}
-
-// ============================================================
-// CREATE EXPORT BITMAP
-// ============================================================
-
-static HBITMAP CreateVideoBitmap(
-    HDC* outputDC,
-    void** outputBits
-)
-{
-    if (!outputDC || !outputBits)
-        return nullptr;
-
-    *outputDC = nullptr;
-    *outputBits = nullptr;
-
-    HDC dc =
-        CreateCompatibleDC(nullptr);
-
-    if (!dc)
-        return nullptr;
-
-    BITMAPINFO bmi{};
-
-    bmi.bmiHeader.biSize =
-        sizeof(BITMAPINFOHEADER);
-
-    bmi.bmiHeader.biWidth =
-        VIDEO_WIDTH;
-
-    bmi.bmiHeader.biHeight =
-        -VIDEO_HEIGHT;
-
-    bmi.bmiHeader.biPlanes = 1;
-
-    bmi.bmiHeader.biBitCount = 32;
-
-    bmi.bmiHeader.biCompression =
-        BI_RGB;
-
-    void* bits = nullptr;
-
-    HBITMAP bitmap =
-        CreateDIBSection(
-            dc,
-            &bmi,
-            DIB_RGB_COLORS,
-            &bits,
-            nullptr,
-            0
-        );
-
-    if (!bitmap)
-    {
-        DeleteDC(dc);
-        return nullptr;
-    }
-
-    *outputDC = dc;
-    *outputBits = bits;
-
-    return bitmap;
-}
-
-// ============================================================
-// PNG ENCODER
-// ============================================================
-
-static bool SaveBitmapAsPNG(
-    const std::wstring& filename,
-    void* bits
-)
-{
-    if (!bits)
-        return false;
-
-    IWICImagingFactory* factory =
-        nullptr;
-
-    IWICBitmapEncoder* encoder =
-        nullptr;
-
-    IWICBitmapFrameEncode* frame =
-        nullptr;
-
-    IStream* stream =
-        nullptr;
-
-    HRESULT hr =
-        CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory)
-        );
-
-    if (FAILED(hr))
-        return false;
-
-    hr =
-        SHCreateStreamOnFileEx(
-            filename.c_str(),
-            STGM_CREATE |
-            STGM_WRITE |
-            STGM_SHARE_DENY_WRITE,
-            FILE_ATTRIBUTE_NORMAL,
-            TRUE,
-            nullptr,
-            &stream
-        );
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            factory->CreateEncoder(
-                GUID_ContainerFormatPng,
-                nullptr,
-                &encoder
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            encoder->Initialize(
-                stream,
-                WICBitmapEncoderNoCache
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            encoder->CreateNewFrame(
-                &frame,
-                nullptr
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            frame->Initialize(
-                nullptr
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            frame->SetSize(
-                VIDEO_WIDTH,
-                VIDEO_HEIGHT
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        WICPixelFormatGUID format =
-            GUID_WICPixelFormat32bppBGRA;
-
-        hr =
-            frame->SetPixelFormat(
-                &format
-            );
-
-        if (
-            SUCCEEDED(hr) &&
-            format != GUID_WICPixelFormat32bppBGRA
-        )
-        {
-            hr = E_FAIL;
-        }
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            frame->WritePixels(
-                VIDEO_HEIGHT,
-                VIDEO_WIDTH * 4,
-                VIDEO_WIDTH *
-                VIDEO_HEIGHT *
-                4,
-                static_cast<BYTE*>(bits)
-            );
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            frame->Commit();
-    }
-
-    if (SUCCEEDED(hr))
-    {
-        hr =
-            encoder->Commit();
-    }
-
-    if (frame)
-        frame->Release();
-
-    if (encoder)
-        encoder->Release();
-
-    if (stream)
-        stream->Release();
-
-    if (factory)
-        factory->Release();
-
-    return SUCCEEDED(hr);
-}
-
-// ============================================================
-// OUTPUT DIRECTORY
-// ============================================================
-
-static std::wstring GetOutputDirectory()
+static std::wstring GetExeDirectory()
 {
     wchar_t path[MAX_PATH]{};
 
@@ -1347,403 +51,714 @@ static std::wstring GetOutputDirectory()
 
     std::wstring result(path);
 
-    size_t slash =
-        result.find_last_of(
-            L"\\/"
-        );
+    size_t pos = result.find_last_of(L"\\/");
 
-    if (
-        slash != std::wstring::npos
-    )
-    {
-        result.resize(slash);
-    }
+    if (pos != std::wstring::npos)
+        result.resize(pos);
 
     return result;
 }
 
-// ============================================================
-// DELETE OLD PNG FRAMES
-// ============================================================
-
-static void DeleteOldPNGFrames(
-    const std::wstring& directory
+static std::wstring GetFileName(
+    const std::wstring& path
 )
 {
-    std::wstring pattern =
-        directory +
-        L"\\frame_*.png";
+    size_t pos = path.find_last_of(L"\\/");
 
-    WIN32_FIND_DATAW data{};
+    if (pos == std::wstring::npos)
+        return path;
 
-    HANDLE find =
-        FindFirstFileW(
-            pattern.c_str(),
-            &data
-        );
+    return path.substr(pos + 1);
+}
 
-    if (find == INVALID_HANDLE_VALUE)
-        return;
+static std::wstring GetExtension(
+    const std::wstring& path
+)
+{
+    size_t pos = path.find_last_of(L'.');
 
-    do
+    if (pos == std::wstring::npos)
+        return L"";
+
+    std::wstring ext = path.substr(pos);
+
+    for (wchar_t& c : ext)
+        c = towlower(c);
+
+    return ext;
+}
+
+static bool IsPNG(
+    const std::wstring& path
+)
+{
+    return GetExtension(path) == L".png";
+}
+
+static void SetStatus(
+    const std::wstring& text
+)
+{
+    if (g_hStatus)
     {
-        std::wstring file =
-            directory +
-            L"\\" +
-            data.cFileName;
-
-        DeleteFileW(
-            file.c_str()
+        SetWindowTextW(
+            g_hStatus,
+            text.c_str()
         );
-
-    } while (
-        FindNextFileW(
-            find,
-            &data
-        )
-    );
-
-    FindClose(find);
+    }
 }
 
 // ============================================================
-// EXPORT PNG SEQUENCE
+// FOLDER PICKER
 // ============================================================
 
-static bool ExportPNGSequence()
+static bool ChooseFolder()
 {
-    if (events.empty())
-    {
-        MessageBoxW(
-            hwndMain,
-            L"Load a timeline first.",
-            L"Export PNG Frames",
-            MB_OK |
-            MB_ICONWARNING
+    BROWSEINFOW bi{};
+    bi.hwndOwner = g_hWnd;
+    bi.lpszTitle = L"Select PNG Frames Folder";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS |
+                 BIF_NEWDIALOGSTYLE;
+
+    PIDLIST_ABSOLUTE pidl =
+        SHBrowseForFolderW(&bi);
+
+    if (!pidl)
+        return false;
+
+    wchar_t path[MAX_PATH]{};
+
+    bool success =
+        SHGetPathFromIDListW(
+            pidl,
+            path
         );
 
+    CoTaskMemFree(pidl);
+
+    if (!success)
         return false;
+
+    g_folder = path;
+
+    SetWindowTextW(
+        g_hFolder,
+        g_folder.c_str()
+    );
+
+    return true;
+}
+
+// ============================================================
+// PNG FILE LIST
+// ============================================================
+
+static std::vector<std::wstring> FindPNGFiles(
+    const std::wstring& folder
+)
+{
+    std::vector<std::wstring> files;
+
+    std::wstring pattern =
+        folder + L"\\*.png";
+
+    WIN32_FIND_DATAW fd{};
+
+    HANDLE hFind =
+        FindFirstFileW(
+            pattern.c_str(),
+            &fd
+        );
+
+    if (hFind == INVALID_HANDLE_VALUE)
+        return files;
+
+    do
+    {
+        if (!(fd.dwFileAttributes &
+              FILE_ATTRIBUTE_DIRECTORY))
+        {
+            std::wstring name =
+                fd.cFileName;
+
+            if (IsPNG(name))
+            {
+                files.push_back(
+                    folder + L"\\" + name
+                );
+            }
+        }
+
+    } while (
+        FindNextFileW(
+            hFind,
+            &fd
+        )
+    );
+
+    FindClose(hFind);
+
+    std::sort(
+        files.begin(),
+        files.end()
+    );
+
+    return files;
+}
+
+// ============================================================
+// WIC PNG LOADING
+// ============================================================
+
+static HRESULT LoadPNG(
+    IWICImagingFactory* factory,
+    const std::wstring& filename,
+    IWICBitmap** output
+)
+{
+    if (!factory ||
+        !output)
+    {
+        return E_INVALIDARG;
     }
 
-    HRESULT comHr =
-        CoInitializeEx(
+    *output = nullptr;
+
+    IWICBitmapDecoder* decoder = nullptr;
+
+    HRESULT hr =
+        factory->CreateDecoderFromFilename(
+            filename.c_str(),
             nullptr,
-            COINIT_APARTMENTTHREADED
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnLoad,
+            &decoder
         );
 
-    bool comInitialized =
-        SUCCEEDED(comHr);
+    if (FAILED(hr))
+        return hr;
 
-    if (
-        FAILED(comHr) &&
-        comHr != RPC_E_CHANGED_MODE
-    )
+    IWICBitmapFrameDecode* frame = nullptr;
+
+    hr =
+        decoder->GetFrame(
+            0,
+            &frame
+        );
+
+    if (SUCCEEDED(hr))
     {
-        MessageBoxW(
-            hwndMain,
-            L"Could not initialize Windows imaging support.",
-            L"Export Failed",
-            MB_OK |
-            MB_ICONERROR
+        IWICFormatConverter* converter =
+            nullptr;
+
+        hr =
+            factory->CreateFormatConverter(
+                &converter
+            );
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                converter->Initialize(
+                    frame,
+                    GUID_WICPixelFormat8bppIndexed,
+                    WICBitmapDitherTypeNone,
+                    nullptr,
+                    0.0,
+                    WICBitmapPaletteTypeMedianCut
+                );
+
+            if (SUCCEEDED(hr))
+            {
+                hr =
+                    factory->CreateBitmapFromSource(
+                        converter,
+                        WICBitmapCacheOnLoad,
+                        output
+                    );
+            }
+
+            converter->Release();
+        }
+
+        frame->Release();
+    }
+
+    decoder->Release();
+
+    return hr;
+}
+
+// ============================================================
+// GIF FRAME DELAY
+// ============================================================
+
+static HRESULT SetFrameDelay(
+    IWICBitmapFrameEncode* frame,
+    UINT delay
+)
+{
+    if (!frame)
+        return E_INVALIDARG;
+
+    IWICMetadataQueryWriter* writer = nullptr;
+
+    HRESULT hr =
+        frame->GetMetadataQueryWriter(
+            &writer
+        );
+
+    if (FAILED(hr))
+        return hr;
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+
+    value.vt = VT_UI4;
+    value.ulVal = delay;
+
+    hr =
+        writer->SetMetadataByName(
+            L"/grctlext/Delay",
+            &value
+        );
+
+    PropVariantClear(&value);
+
+    writer->Release();
+
+    return hr;
+}
+
+// ============================================================
+// GIF LOOP
+// ============================================================
+
+static HRESULT SetLoopCount(
+    IWICMetadataQueryWriter* writer,
+    UINT loopCount
+)
+{
+    if (!writer)
+        return E_INVALIDARG;
+
+    IWICMetadataBlockWriter* blockWriter =
+        nullptr;
+
+    HRESULT hr =
+        writer->QueryInterface(
+            IID_PPV_ARGS(&blockWriter)
+        );
+
+    if (FAILED(hr))
+        return hr;
+
+    blockWriter->Release();
+
+    PROPVARIANT value;
+    PropVariantInit(&value);
+
+    value.vt = VT_UI2;
+    value.uiVal =
+        static_cast<USHORT>(loopCount);
+
+    hr =
+        writer->SetMetadataByName(
+            L"/appext/Data",
+            &value
+        );
+
+    PropVariantClear(&value);
+
+    return hr;
+}
+
+// ============================================================
+// GIF CREATION
+// ============================================================
+
+static bool ConvertPNGFolderToGIF(
+    const std::wstring& folder,
+    const std::wstring& outputFile,
+    int fps
+)
+{
+    if (folder.empty())
+    {
+        SetStatus(
+            L"Please select a PNG folder."
         );
 
         return false;
     }
 
-    std::wstring outputDirectory =
-        GetOutputDirectory() +
-        L"\\APM_Replay_Frames";
-
-    CreateDirectoryW(
-        outputDirectory.c_str(),
-        nullptr
-    );
-
-    DeleteOldPNGFrames(
-        outputDirectory
-    );
-
-    HDC videoDC = nullptr;
-    void* bits = nullptr;
-
-    HBITMAP bitmap =
-        CreateVideoBitmap(
-            &videoDC,
-            &bits
-        );
-
-    if (!bitmap)
+    if (outputFile.empty())
     {
-        if (comInitialized)
-            CoUninitialize();
-
-        MessageBoxW(
-            hwndMain,
-            L"Could not create the export frame buffer.",
-            L"Export Failed",
-            MB_OK |
-            MB_ICONERROR
+        SetStatus(
+            L"Please select an output GIF."
         );
 
         return false;
     }
 
-    HBITMAP oldBitmap =
-        static_cast<HBITMAP>(
-            SelectObject(
-                videoDC,
-                bitmap
-            )
+    if (fps < 1)
+        fps = 1;
+
+    if (fps > 100)
+        fps = 100;
+
+    std::vector<std::wstring> files =
+        FindPNGFiles(folder);
+
+    if (files.empty())
+    {
+        SetStatus(
+            L"No PNG files found."
         );
 
-    const long long totalFrames =
-        static_cast<long long>(
-            std::ceil(
-                duration *
-                static_cast<double>(FPS)
+        return false;
+    }
+
+    IWICImagingFactory* factory =
+        nullptr;
+
+    HRESULT hr =
+        CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory)
+        );
+
+    if (FAILED(hr))
+    {
+        SetStatus(
+            L"Could not initialize WIC."
+        );
+
+        return false;
+    }
+
+    IWICStream* stream = nullptr;
+
+    hr =
+        factory->CreateStream(
+            &stream
+        );
+
+    if (FAILED(hr))
+    {
+        factory->Release();
+
+        SetStatus(
+            L"Could not create output stream."
+        );
+
+        return false;
+    }
+
+    hr =
+        stream->InitializeFromFilename(
+            outputFile.c_str(),
+            GENERIC_WRITE
+        );
+
+    if (FAILED(hr))
+    {
+        stream->Release();
+        factory->Release();
+
+        SetStatus(
+            L"Could not open output GIF."
+        );
+
+        return false;
+    }
+
+    IWICBitmapEncoder* encoder =
+        nullptr;
+
+    hr =
+        factory->CreateEncoder(
+            GUID_ContainerFormatGif,
+            nullptr,
+            &encoder
+        );
+
+    if (FAILED(hr))
+    {
+        stream->Release();
+        factory->Release();
+
+        SetStatus(
+            L"Could not create GIF encoder."
+        );
+
+        return false;
+    }
+
+    hr =
+        encoder->Initialize(
+            stream,
+            WICBitmapEncoderNoCache
+        );
+
+    if (FAILED(hr))
+    {
+        encoder->Release();
+        stream->Release();
+        factory->Release();
+
+        SetStatus(
+            L"Could not initialize GIF encoder."
+        );
+
+        return false;
+    }
+
+    const UINT delay =
+        static_cast<UINT>(
+            std::max(
+                1,
+                static_cast<int>(
+                    100.0 / fps + 0.5
+                )
             )
         );
 
     bool success = true;
 
-    for (
-        long long frame = 0;
-        frame < totalFrames;
-        ++frame
-    )
+    for (size_t i = 0; i < files.size(); ++i)
     {
-        currentTime =
-            static_cast<double>(frame) /
-            static_cast<double>(FPS);
+        std::wstringstream status;
 
-        ResetPlaybackState();
+        status
+            << L"Converting "
+            << (i + 1)
+            << L" / "
+            << files.size();
 
-        ProcessEventsTo(
-            currentTime
+        SetStatus(
+            status.str()
         );
 
-        RenderScene(
-            videoDC,
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT
-        );
+        IWICBitmap* bitmap = nullptr;
 
-        wchar_t filename[64]{};
+        hr =
+            LoadPNG(
+                factory,
+                files[i],
+                &bitmap
+            );
 
-        swprintf_s(
-            filename,
-            L"\\frame_%06lld.png",
-            frame
-        );
+        if (FAILED(hr))
+        {
+            success = false;
+            break;
+        }
 
-        if (
-            !SaveBitmapAsPNG(
-                outputDirectory + filename,
-                bits
-            )
-        )
+        IWICBitmapFrameEncode* frame =
+            nullptr;
+
+        IPropertyBag2* props = nullptr;
+
+        hr =
+            encoder->CreateNewFrame(
+                &frame,
+                &props
+            );
+
+        if (props)
+            props->Release();
+
+        if (FAILED(hr))
+        {
+            bitmap->Release();
+            success = false;
+            break;
+        }
+
+        hr =
+            frame->Initialize(
+                nullptr
+            );
+
+        if (SUCCEEDED(hr))
+        {
+            UINT width = 0;
+            UINT height = 0;
+
+            bitmap->GetSize(
+                &width,
+                &height
+            );
+
+            hr =
+                frame->SetSize(
+                    width,
+                    height
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            WICPixelFormatGUID format =
+                GUID_WICPixelFormat8bppIndexed;
+
+            hr =
+                frame->SetPixelFormat(
+                    &format
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            IWICPalette* palette = nullptr;
+
+            hr =
+                factory->CreatePalette(
+                    &palette
+                );
+
+            if (SUCCEEDED(hr))
+            {
+                hr =
+                    palette->InitializeFromBitmap(
+                        bitmap,
+                        256,
+                        false
+                    );
+
+                if (SUCCEEDED(hr))
+                {
+                    hr =
+                        frame->SetPalette(
+                            palette
+                        );
+                }
+
+                palette->Release();
+            }
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frame->WriteSource(
+                    bitmap,
+                    nullptr
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                SetFrameDelay(
+                    frame,
+                    delay
+                );
+        }
+
+        if (SUCCEEDED(hr))
+        {
+            hr =
+                frame->Commit();
+        }
+
+        frame->Release();
+        bitmap->Release();
+
+        if (FAILED(hr))
         {
             success = false;
             break;
         }
     }
 
-    SelectObject(
-        videoDC,
-        oldBitmap
-    );
+    if (success)
+    {
+        hr =
+            encoder->Commit();
 
-    DeleteObject(bitmap);
-    DeleteDC(videoDC);
+        if (FAILED(hr))
+            success = false;
+    }
 
-    currentTime = 0.0;
-    ResetPlaybackState();
-
-    if (comInitialized)
-        CoUninitialize();
+    encoder->Release();
+    stream->Release();
+    factory->Release();
 
     if (success)
     {
-        std::wstring message =
-            L"PNG frames exported successfully:\n\n" +
-            outputDirectory;
-
-        MessageBoxW(
-            hwndMain,
-            message.c_str(),
-            L"Export Complete",
-            MB_OK |
-            MB_ICONINFORMATION
+        SetStatus(
+            L"Done! GIF created successfully."
         );
     }
     else
     {
-        MessageBoxW(
-            hwndMain,
-            L"PNG frame export failed.",
-            L"Export Failed",
-            MB_OK |
-            MB_ICONERROR
+        SetStatus(
+            L"GIF conversion failed."
         );
     }
-
-    InvalidateRect(
-        hwndMain,
-        nullptr,
-        TRUE
-    );
 
     return success;
 }
 
 // ============================================================
-// PREVIEW
+// OUTPUT FILE PICKER
 // ============================================================
 
-static void DrawPreview(HDC hdc)
+static bool ChooseOutputFile()
 {
-    RECT client{};
+    OPENFILENAMEW ofn{};
 
-    GetClientRect(
-        hwndMain,
-        &client
+    wchar_t filename[MAX_PATH]{};
+    wcscpy_s(
+        filename,
+        L"animation.gif"
     );
 
-    int clientWidth =
-        client.right -
-        client.left;
+    ofn.lStructSize =
+        sizeof(ofn);
 
-    int clientHeight =
-        client.bottom -
-        client.top;
+    ofn.hwndOwner =
+        g_hWnd;
 
-    if (
-        clientWidth <= 0 ||
-        clientHeight <= 0
-    )
-    {
-        return;
-    }
+    ofn.lpstrFilter =
+        L"GIF Files (*.gif)\0*.gif\0"
+        L"All Files (*.*)\0*.*\0";
 
-    HDC memoryDC =
-        CreateCompatibleDC(hdc);
+    ofn.lpstrFile =
+        filename;
 
-    if (!memoryDC)
-        return;
+    ofn.nMaxFile =
+        MAX_PATH;
 
-    BITMAPINFO bmi{};
+    ofn.Flags =
+        OFN_OVERWRITEPROMPT |
+        OFN_PATHMUSTEXIST;
 
-    bmi.bmiHeader.biSize =
-        sizeof(BITMAPINFOHEADER);
+    ofn.lpstrDefExt =
+        L"gif";
 
-    bmi.bmiHeader.biWidth =
-        VIDEO_WIDTH;
+    if (!GetSaveFileNameW(&ofn))
+        return false;
 
-    bmi.bmiHeader.biHeight =
-        -VIDEO_HEIGHT;
+    g_output = filename;
 
-    bmi.bmiHeader.biPlanes = 1;
-
-    bmi.bmiHeader.biBitCount = 32;
-
-    bmi.bmiHeader.biCompression =
-        BI_RGB;
-
-    void* bits = nullptr;
-
-    HBITMAP bitmap =
-        CreateDIBSection(
-            hdc,
-            &bmi,
-            DIB_RGB_COLORS,
-            &bits,
-            nullptr,
-            0
-        );
-
-    if (!bitmap)
-    {
-        DeleteDC(memoryDC);
-        return;
-    }
-
-    HBITMAP oldBitmap =
-        static_cast<HBITMAP>(
-            SelectObject(
-                memoryDC,
-                bitmap
-            )
-        );
-
-    RenderScene(
-        memoryDC,
-        VIDEO_WIDTH,
-        VIDEO_HEIGHT
+    SetWindowTextW(
+        g_hOutput,
+        g_output.c_str()
     );
 
-    double scaleX =
-        static_cast<double>(clientWidth) /
-        static_cast<double>(VIDEO_WIDTH);
-
-    double scaleY =
-        static_cast<double>(clientHeight) /
-        static_cast<double>(VIDEO_HEIGHT);
-
-    double scale =
-        std::min(
-            scaleX,
-            scaleY
-        );
-
-    int drawWidth =
-        static_cast<int>(
-            VIDEO_WIDTH * scale
-        );
-
-    int drawHeight =
-        static_cast<int>(
-            VIDEO_HEIGHT * scale
-        );
-
-    int x =
-        (clientWidth - drawWidth) / 2;
-
-    int y =
-        (clientHeight - drawHeight) / 2;
-
-    SetStretchBltMode(
-        hdc,
-        HALFTONE
-    );
-
-    StretchBlt(
-        hdc,
-        x,
-        y,
-        drawWidth,
-        drawHeight,
-        memoryDC,
-        0,
-        0,
-        VIDEO_WIDTH,
-        VIDEO_HEIGHT,
-        SRCCOPY
-    );
-
-    SelectObject(
-        memoryDC,
-        oldBitmap
-    );
-
-    DeleteObject(bitmap);
-    DeleteDC(memoryDC);
+    return true;
 }
 
 // ============================================================
 // WINDOW PROCEDURE
 // ============================================================
 
-static LRESULT CALLBACK WindowProc(
+static LRESULT CALLBACK WndProc(
     HWND hwnd,
     UINT msg,
     WPARAM wParam,
@@ -1757,17 +772,39 @@ static LRESULT CALLBACK WindowProc(
             switch (LOWORD(wParam))
             {
                 case 1001:
-                    LoadTimelineFromEditor();
+                {
+                    ChooseFolder();
                     return 0;
+                }
 
                 case 1002:
                 {
-                    if (events.empty())
+                    ChooseOutputFile();
+                    return 0;
+                }
+
+                case 1003:
+                {
+                    wchar_t fpsText[32]{};
+
+                    GetWindowTextW(
+                        g_hFPS,
+                        fpsText,
+                        32
+                    );
+
+                    int fps =
+                        _wtoi(fpsText);
+
+                    if (fps <= 0)
+                        fps = 60;
+
+                    if (g_folder.empty())
                     {
                         MessageBoxW(
-                            hwndMain,
-                            L"Load a timeline first.",
-                            L"Playback",
+                            hwnd,
+                            L"Select the PNG folder first.",
+                            L"PNG to GIF",
                             MB_OK |
                             MB_ICONWARNING
                         );
@@ -1775,224 +812,62 @@ static LRESULT CALLBACK WindowProc(
                         return 0;
                     }
 
-                    playing =
-                        !playing;
-
-                    if (playing)
+                    if (g_output.empty())
                     {
-                        QueryPerformanceFrequency(
-                            &performanceFrequency
+                        MessageBoxW(
+                            hwnd,
+                            L"Select an output GIF first.",
+                            L"PNG to GIF",
+                            MB_OK |
+                            MB_ICONWARNING
                         );
 
-                        QueryPerformanceCounter(
-                            &lastPerformanceTime
-                        );
-
-                        SetWindowTextW(
-                            hwndPlay,
-                            L"Pause"
-                        );
+                        return 0;
                     }
-                    else
+
+                    EnableWindow(
+                        g_hConvert,
+                        FALSE
+                    );
+
+                    bool result =
+                        ConvertPNGFolderToGIF(
+                            g_folder,
+                            g_output,
+                            fps
+                        );
+
+                    EnableWindow(
+                        g_hConvert,
+                        TRUE
+                    );
+
+                    if (result)
                     {
-                        SetWindowTextW(
-                            hwndPlay,
-                            L"Play"
+                        MessageBoxW(
+                            hwnd,
+                            L"GIF conversion completed.",
+                            L"PNG to GIF",
+                            MB_OK |
+                            MB_ICONINFORMATION
                         );
                     }
 
                     return 0;
                 }
-
-                case 1003:
-                    ResetVisualizer();
-                    return 0;
-
-                case 1004:
-                    ExportPNGSequence();
-                    return 0;
             }
 
             break;
         }
 
-        case WM_TIMER:
+        case WM_CLOSE:
         {
-            if (
-                wParam == TIMER_PREVIEW &&
-                playing
-            )
-            {
-                LARGE_INTEGER now{};
-
-                QueryPerformanceCounter(
-                    &now
-                );
-
-                double elapsed =
-                    static_cast<double>(
-                        now.QuadPart -
-                        lastPerformanceTime.QuadPart
-                    ) /
-                    static_cast<double>(
-                        performanceFrequency.QuadPart
-                    );
-
-                lastPerformanceTime =
-                    now;
-
-                if (elapsed < 0.0)
-                    elapsed = 0.0;
-
-                if (elapsed > 0.1)
-                    elapsed = 0.1;
-
-                currentTime += elapsed;
-
-                if (currentTime >= duration)
-                {
-                    currentTime =
-                        duration;
-
-                    playing = false;
-
-                    SetWindowTextW(
-                        hwndPlay,
-                        L"Play"
-                    );
-                }
-
-                ResetPlaybackState();
-
-                ProcessEventsTo(
-                    currentTime
-                );
-
-                InvalidateRect(
-                    hwndMain,
-                    nullptr,
-                    FALSE
-                );
-            }
-
-            return 0;
-        }
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-
-            HDC hdc =
-                BeginPaint(
-                    hwnd,
-                    &ps
-                );
-
-            DrawPreview(hdc);
-
-            EndPaint(
-                hwnd,
-                &ps
-            );
-
-            return 0;
-        }
-
-        case WM_SIZE:
-        {
-            if (hwndTimeline)
-            {
-                RECT client{};
-
-                GetClientRect(
-                    hwnd,
-                    &client
-                );
-
-                int width =
-                    client.right -
-                    client.left;
-
-                int height =
-                    client.bottom -
-                    client.top;
-
-                const int margin = 10;
-                const int buttonHeight = 32;
-                const int buttonWidth = 130;
-                const int gap = 8;
-
-                int editorBottom =
-                    height -
-                    buttonHeight -
-                    margin * 2;
-
-                if (editorBottom < 100)
-                    editorBottom = 100;
-
-                MoveWindow(
-                    hwndTimeline,
-                    margin,
-                    margin,
-                    width - margin * 2,
-                    editorBottom - margin,
-                    TRUE
-                );
-
-                int y =
-                    editorBottom + margin;
-
-                MoveWindow(
-                    hwndLoad,
-                    margin,
-                    y,
-                    buttonWidth,
-                    buttonHeight,
-                    TRUE
-                );
-
-                MoveWindow(
-                    hwndPlay,
-                    margin +
-                    buttonWidth +
-                    gap,
-                    y,
-                    buttonWidth,
-                    buttonHeight,
-                    TRUE
-                );
-
-                MoveWindow(
-                    hwndReset,
-                    margin +
-                    (buttonWidth + gap) * 2,
-                    y,
-                    buttonWidth,
-                    buttonHeight,
-                    TRUE
-                );
-
-                MoveWindow(
-                    hwndExportPNG,
-                    margin +
-                    (buttonWidth + gap) * 3,
-                    y,
-                    170,
-                    buttonHeight,
-                    TRUE
-                );
-            }
-
+            DestroyWindow(hwnd);
             return 0;
         }
 
         case WM_DESTROY:
         {
-            KillTimer(
-                hwnd,
-                TIMER_PREVIEW
-            );
-
             PostQuitMessage(0);
             return 0;
         }
@@ -2007,7 +882,7 @@ static LRESULT CALLBACK WindowProc(
 }
 
 // ============================================================
-// ENTRY POINT
+// WINMAIN
 // ============================================================
 
 int WINAPI wWinMain(
@@ -2017,16 +892,35 @@ int WINAPI wWinMain(
     int nCmdShow
 )
 {
+    HRESULT hr =
+        CoInitializeEx(
+            nullptr,
+            COINIT_APARTMENTTHREADED
+        );
+
+    if (FAILED(hr))
+    {
+        MessageBoxW(
+            nullptr,
+            L"COM initialization failed.",
+            L"PNG to GIF",
+            MB_OK |
+            MB_ICONERROR
+        );
+
+        return 1;
+    }
+
+    const wchar_t CLASS_NAME[] =
+        L"PNGToGIFConverterWindow";
+
     WNDCLASSW wc{};
 
     wc.lpfnWndProc =
-        WindowProc;
+        WndProc;
 
     wc.hInstance =
         hInstance;
-
-    wc.lpszClassName =
-        L"APMTimelineVisualizer";
 
     wc.hCursor =
         LoadCursorW(
@@ -2039,182 +933,267 @@ int WINAPI wWinMain(
             COLOR_WINDOW + 1
         );
 
-    if (
-        !RegisterClassW(&wc)
-    )
+    wc.lpszClassName =
+        CLASS_NAME;
+
+    RegisterClassW(&wc);
+
+    g_hWnd =
+        CreateWindowExW(
+            0,
+            CLASS_NAME,
+            L"PNG to GIF Converter",
+            WS_OVERLAPPED |
+            WS_CAPTION |
+            WS_SYSMENU |
+            WS_MINIMIZEBOX,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            700,
+            360,
+            nullptr,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    if (!g_hWnd)
     {
+        CoUninitialize();
         return 1;
     }
 
-    hwndMain =
-        CreateWindowExW(
-            0,
-            wc.lpszClassName,
-            L"APM Timeline Visualizer",
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
-            nullptr,
-            nullptr,
-            hInstance,
-            nullptr
-        );
-
-    if (!hwndMain)
-        return 1;
-
-    hwndTimeline =
-        CreateWindowExW(
-            WS_EX_CLIENTEDGE,
-            L"EDIT",
-            L"",
-            WS_CHILD |
-            WS_VISIBLE |
-            WS_VSCROLL |
-            WS_HSCROLL |
-            ES_MULTILINE |
-            ES_AUTOVSCROLL |
-            ES_AUTOHSCROLL |
-            ES_WANTRETURN,
-            10,
-            10,
-            100,
-            100,
-            hwndMain,
-            nullptr,
-            hInstance,
-            nullptr
-        );
-
-    hwndLoad =
-        CreateWindowW(
-            L"BUTTON",
-            L"Load Timeline",
-            WS_CHILD |
-            WS_VISIBLE |
-            BS_PUSHBUTTON,
-            10,
-            10,
-            130,
-            32,
-            hwndMain,
-            reinterpret_cast<HMENU>(1001),
-            hInstance,
-            nullptr
-        );
-
-    hwndPlay =
-        CreateWindowW(
-            L"BUTTON",
-            L"Play",
-            WS_CHILD |
-            WS_VISIBLE |
-            BS_PUSHBUTTON,
-            150,
-            10,
-            130,
-            32,
-            hwndMain,
-            reinterpret_cast<HMENU>(1002),
-            hInstance,
-            nullptr
-        );
-
-    hwndReset =
-        CreateWindowW(
-            L"BUTTON",
-            L"Reset",
-            WS_CHILD |
-            WS_VISIBLE |
-            BS_PUSHBUTTON,
-            290,
-            10,
-            130,
-            32,
-            hwndMain,
-            reinterpret_cast<HMENU>(1003),
-            hInstance,
-            nullptr
-        );
-
-    hwndExportPNG =
-        CreateWindowW(
-            L"BUTTON",
-            L"Export PNG Frames",
-            WS_CHILD |
-            WS_VISIBLE |
-            BS_PUSHBUTTON,
-            430,
-            10,
-            170,
-            32,
-            hwndMain,
-            reinterpret_cast<HMENU>(1004),
-            hInstance,
-            nullptr
-        );
-
-    HFONT uiFont =
+    HFONT font =
         static_cast<HFONT>(
             GetStockObject(
                 DEFAULT_GUI_FONT
             )
         );
 
-    SendMessageW(
-        hwndTimeline,
-        WM_SETFONT,
-        reinterpret_cast<WPARAM>(uiFont),
-        TRUE
-    );
-
-    SendMessageW(
-        hwndLoad,
-        WM_SETFONT,
-        reinterpret_cast<WPARAM>(uiFont),
-        TRUE
-    );
-
-    SendMessageW(
-        hwndPlay,
-        WM_SETFONT,
-        reinterpret_cast<WPARAM>(uiFont),
-        TRUE
-    );
-
-    SendMessageW(
-        hwndReset,
-        WM_SETFONT,
-        reinterpret_cast<WPARAM>(uiFont),
-        TRUE
-    );
-
-    SendMessageW(
-        hwndExportPNG,
-        WM_SETFONT,
-        reinterpret_cast<WPARAM>(uiFont),
-        TRUE
-    );
-
-    QueryPerformanceFrequency(
-        &performanceFrequency
-    );
-
-    SetTimer(
-        hwndMain,
-        TIMER_PREVIEW,
-        16,
+    CreateWindowW(
+        L"STATIC",
+        L"PNG Frames Folder:",
+        WS_CHILD |
+        WS_VISIBLE,
+        25,
+        30,
+        160,
+        25,
+        g_hWnd,
+        nullptr,
+        hInstance,
         nullptr
     );
 
+    g_hFolder =
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            WS_CHILD |
+            WS_VISIBLE |
+            ES_AUTOHSCROLL,
+            190,
+            27,
+            390,
+            28,
+            g_hWnd,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    HWND browseFolder =
+        CreateWindowW(
+            L"BUTTON",
+            L"Browse...",
+            WS_CHILD |
+            WS_VISIBLE |
+            BS_PUSHBUTTON,
+            585,
+            27,
+            85,
+            28,
+            g_hWnd,
+            reinterpret_cast<HMENU>(1001),
+            hInstance,
+            nullptr
+        );
+
+    CreateWindowW(
+        L"STATIC",
+        L"FPS:",
+        WS_CHILD |
+        WS_VISIBLE,
+        25,
+        80,
+        160,
+        25,
+        g_hWnd,
+        nullptr,
+        hInstance,
+        nullptr
+    );
+
+    g_hFPS =
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"60",
+            WS_CHILD |
+            WS_VISIBLE |
+            ES_NUMBER |
+            ES_AUTOHSCROLL,
+            190,
+            77,
+            100,
+            28,
+            g_hWnd,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    CreateWindowW(
+        L"STATIC",
+        L"Output GIF:",
+        WS_CHILD |
+        WS_VISIBLE,
+        25,
+        130,
+        160,
+        25,
+        g_hWnd,
+        nullptr,
+        hInstance,
+        nullptr
+    );
+
+    g_hOutput =
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            L"",
+            WS_CHILD |
+            WS_VISIBLE |
+            ES_AUTOHSCROLL,
+            190,
+            127,
+            390,
+            28,
+            g_hWnd,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    HWND browseOutput =
+        CreateWindowW(
+            L"BUTTON",
+            L"Browse...",
+            WS_CHILD |
+            WS_VISIBLE |
+            BS_PUSHBUTTON,
+            585,
+            127,
+            85,
+            28,
+            g_hWnd,
+            reinterpret_cast<HMENU>(1002),
+            hInstance,
+            nullptr
+        );
+
+    g_hConvert =
+        CreateWindowW(
+            L"BUTTON",
+            L"Convert PNG to GIF",
+            WS_CHILD |
+            WS_VISIBLE |
+            BS_DEFPUSHBUTTON,
+            190,
+            190,
+            250,
+            42,
+            g_hWnd,
+            reinterpret_cast<HMENU>(1003),
+            hInstance,
+            nullptr
+        );
+
+    g_hStatus =
+        CreateWindowW(
+            L"STATIC",
+            L"Select a PNG frames folder.",
+            WS_CHILD |
+            WS_VISIBLE,
+            25,
+            255,
+            640,
+            30,
+            g_hWnd,
+            nullptr,
+            hInstance,
+            nullptr
+        );
+
+    SendMessageW(
+        g_hFolder,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        g_hFPS,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        g_hOutput,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        g_hConvert,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        browseFolder,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        browseOutput,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
+    SendMessageW(
+        g_hStatus,
+        WM_SETFONT,
+        reinterpret_cast<WPARAM>(font),
+        TRUE
+    );
+
     ShowWindow(
-        hwndMain,
+        g_hWnd,
         nCmdShow
     );
 
-    UpdateWindow(hwndMain);
+    UpdateWindow(
+        g_hWnd
+    );
 
     MSG msg{};
 
@@ -2230,6 +1209,8 @@ int WINAPI wWinMain(
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    CoUninitialize();
 
     return static_cast<int>(
         msg.wParam
