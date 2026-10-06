@@ -789,31 +789,26 @@ static void ApplyWindowMode()
 
     if (clickableMode)
     {
-        // IMPORTANT:
-        // Remove NOACTIVATE so Windows allows
-        // the overlay to receive focus and
-        // perform normal dragging/resizing.
+        // CLICKABLE:
+        // - receive mouse input
+        // - allow activation
+        // - allow moving
+        // - allow resizing
+        exStyle &= ~WS_EX_TRANSPARENT;
+        exStyle &= ~WS_EX_NOACTIVATE;
 
-        exStyle &=
-            ~WS_EX_NOACTIVATE;
-
-        exStyle &=
-            ~WS_EX_TRANSPARENT;
-
-        style |=
-            WS_THICKFRAME;
+        style |= WS_THICKFRAME;
     }
     else
     {
-        // Pass-through mode.
-        exStyle |=
-            WS_EX_NOACTIVATE;
+        // PASS-THROUGH:
+        // - mouse goes through overlay
+        // - overlay cannot activate
+        // - no resize frame
+        exStyle |= WS_EX_TRANSPARENT;
+        exStyle |= WS_EX_NOACTIVATE;
 
-        exStyle |=
-            WS_EX_TRANSPARENT;
-
-        style &=
-            ~WS_THICKFRAME;
+        style &= ~WS_THICKFRAME;
     }
 
     SetWindowLongPtrW(
@@ -828,15 +823,7 @@ static void ApplyWindowMode()
         style
     );
 
-    UINT flags =
-        SWP_FRAMECHANGED |
-        SWP_SHOWWINDOW;
-
-    // Do NOT use SWP_NOACTIVATE when
-    // entering clickable mode.
-    if (!clickableMode)
-        flags |= SWP_NOACTIVATE;
-
+    // Keep the exact current position and size.
     SetWindowPos(
         hwndOverlay,
         HWND_TOPMOST,
@@ -844,15 +831,9 @@ static void ApplyWindowMode()
         overlayY,
         overlayWidth,
         overlayHeight,
-        flags
+        SWP_FRAMECHANGED |
+        SWP_SHOWWINDOW
     );
-
-    if (clickableMode)
-    {
-        SetForegroundWindow(
-            hwndOverlay
-        );
-    }
 
     InvalidateRect(
         hwndOverlay,
