@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 jobs:
@@ -12,7 +11,6 @@ jobs:
     runs-on: windows-latest
 
     steps:
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -27,7 +25,7 @@ jobs:
       - name: Build APM Timeline Visualizer
         shell: cmd
         run: |
-          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
+          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib mfplat.lib mfreadwrite.lib mfuuid.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
 
       - name: Create APM Tools ZIP
         shell: powershell
