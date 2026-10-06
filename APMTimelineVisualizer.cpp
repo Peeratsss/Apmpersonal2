@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
+#define NOMINMAX
 
 #include <windows.h>
 #include <windowsx.h>
@@ -10,7 +11,6 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mftransform.h>
-#include <mfuuid.h>
 
 #include <string>
 #include <vector>
@@ -34,7 +34,6 @@ static const int VIDEO_WIDTH = 1920;
 static const int VIDEO_HEIGHT = 1080;
 
 static const int FPS = 60;
-
 static const int DEFAULT_WIDTH = 1100;
 static const int DEFAULT_HEIGHT = 850;
 
@@ -171,8 +170,10 @@ static bool ParseTimestamp(
 
     ampm = ToUpper(ampm);
 
-    if (ampm != L"AM" &&
-        ampm != L"PM")
+    if (
+        ampm != L"AM" &&
+        ampm != L"PM"
+    )
     {
         return false;
     }
@@ -249,6 +250,7 @@ static bool ParseTimeline(
         {
             // Find AM/PM and use everything before it
             // as timestamp and everything after as input.
+
             std::wstring upper =
                 ToUpper(line);
 
@@ -258,14 +260,19 @@ static bool ParseTimeline(
             size_t pmPos =
                 upper.find(L" PM");
 
-            size_t pos = std::wstring::npos;
+            size_t pos =
+                std::wstring::npos;
 
             if (amPos != std::wstring::npos)
                 pos = amPos;
 
-            if (pmPos != std::wstring::npos &&
-                (pos == std::wstring::npos ||
-                 pmPos < pos))
+            if (
+                pmPos != std::wstring::npos &&
+                (
+                    pos == std::wstring::npos ||
+                    pmPos < pos
+                )
+            )
             {
                 pos = pmPos;
             }
@@ -273,38 +280,50 @@ static bool ParseTimeline(
             if (pos == std::wstring::npos)
                 continue;
 
-            size_t timestampEnd = pos + 3;
+            size_t timestampEnd =
+                pos + 3;
 
             timestampText =
-                Trim(line.substr(
-                    0,
-                    timestampEnd
-                ));
+                Trim(
+                    line.substr(
+                        0,
+                        timestampEnd
+                    )
+                );
 
             inputName =
-                Trim(line.substr(
-                    timestampEnd
-                ));
+                Trim(
+                    line.substr(
+                        timestampEnd
+                    )
+                );
         }
 
-        if (timestampText.empty() ||
-            inputName.empty())
+        if (
+            timestampText.empty() ||
+            inputName.empty()
+        )
         {
             continue;
         }
 
         double clockSeconds = 0.0;
 
-        if (!ParseTimestamp(
+        if (
+            !ParseTimestamp(
                 timestampText,
-                clockSeconds))
+                clockSeconds
+            )
+        )
         {
             continue;
         }
 
         // Handle midnight rollover.
-        if (previousClock >= 0.0 &&
-            clockSeconds < previousClock)
+        if (
+            previousClock >= 0.0 &&
+            clockSeconds < previousClock
+        )
         {
             dayOffset += 86400.0;
         }
@@ -316,11 +335,15 @@ static bool ParseTimeline(
         event.time =
             clockSeconds + dayOffset;
 
-        event.name = inputName;
+        event.name =
+            inputName;
 
-        if (EndsWith(
+        if (
+            EndsWith(
                 event.name,
-                L"_UP"))
+                L"_UP"
+            )
+        )
         {
             event.down = false;
 
@@ -631,8 +654,8 @@ static void DrawKey(
 
     COLORREF background =
         pressed
-        ? RGB(255, 170, 40)
-        : RGB(55, 55, 60);
+            ? RGB(255, 170, 40)
+            : RGB(55, 55, 60);
 
     FillRectColor(
         hdc,
@@ -651,7 +674,10 @@ static void DrawKey(
         );
 
     HGDIOBJ oldPen =
-        SelectObject(hdc, pen);
+        SelectObject(
+            hdc,
+            pen
+        );
 
     HGDIOBJ oldBrush =
         SelectObject(
@@ -1038,8 +1064,8 @@ static void RenderScene(
 
     double progress =
         duration > 0.0
-        ? currentTime / duration
-        : 0.0;
+            ? currentTime / duration
+            : 0.0;
 
     progress =
         std::max(
@@ -1610,8 +1636,10 @@ static bool ExportMP4()
     {
         MessageBoxW(
             hwndMain,
-            (L"MP4 exported successfully:\n\n" +
-             outputPath).c_str(),
+            (
+                L"MP4 exported successfully:\n\n" +
+                outputPath
+            ).c_str(),
             L"Export Complete",
             MB_OK |
             MB_ICONINFORMATION
@@ -1833,8 +1861,10 @@ static LRESULT CALLBACK WindowProc(
 
         case WM_TIMER:
         {
-            if (wParam == TIMER_PREVIEW &&
-                playing)
+            if (
+                wParam == TIMER_PREVIEW &&
+                playing
+            )
             {
                 LARGE_INTEGER now{};
 
@@ -1890,6 +1920,7 @@ static LRESULT CALLBACK WindowProc(
                 );
 
             RECT client{};
+
             GetClientRect(
                 hwnd,
                 &client
@@ -1913,8 +1944,10 @@ static LRESULT CALLBACK WindowProc(
             int previewHeight =
                 client.bottom - sceneTop;
 
-            if (previewWidth > 0 &&
-                previewHeight > 0)
+            if (
+                previewWidth > 0 &&
+                previewHeight > 0
+            )
             {
                 HDC memDC =
                     CreateCompatibleDC(hdc);
@@ -1930,8 +1963,12 @@ static LRESULT CALLBACK WindowProc(
                 bmi.bmiHeader.biHeight =
                     -previewHeight;
 
-                bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
+                bmi.bmiHeader.biPlanes =
+                    1;
+
+                bmi.bmiHeader.biBitCount =
+                    32;
+
                 bmi.bmiHeader.biCompression =
                     BI_RGB;
 
@@ -1959,6 +1996,7 @@ static LRESULT CALLBACK WindowProc(
 
                     // Render directly at preview resolution.
                     ResetPlaybackState();
+
                     ProcessEventsTo(
                         currentTime
                     );
@@ -2107,12 +2145,14 @@ int WINAPI wWinMain(
 
     MSG msg{};
 
-    while (GetMessageW(
-        &msg,
-        nullptr,
-        0,
-        0
-    ) > 0)
+    while (
+        GetMessageW(
+            &msg,
+            nullptr,
+            0,
+            0
+        ) > 0
+    )
     {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
