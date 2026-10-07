@@ -240,17 +240,39 @@ static bool exportGif(){
  EncoderParameters add{};add.Count=1;add.Parameter[0].Guid=EncoderSaveFlag;add.Parameter[0].Type=EncoderParameterValueTypeLong;
  add.Parameter[0].NumberOfValues=1;ULONG ft=EncoderValueFrameDimensionTime;add.Parameter[0].Value=&ft;
  long long n=std::max<long long>(1,(long long)std::ceil(lengthSec*FPS));
- for(long long i=1;i<n;i++){Bitmap*x=frame((double)i/FPS);if(!x){first->SaveAdd(EncoderValueFlush);delete first;return false;}
+ for(long long i=1;i<n;i++){Bitmap*x=frame((double)i/FPS);if(!x){
+   EncoderParameters flush{}; flush.Count=1;
+   flush.Parameter[0].Guid=EncoderSaveFlag;
+   flush.Parameter[0].Type=EncoderParameterValueTypeLong;
+   flush.Parameter[0].NumberOfValues=1;
+   ULONG fv=EncoderValueFlush; flush.Parameter[0].Value=&fv;
+   first->SaveAdd(&flush); delete first; return false;
+  }
   prop(x,PropertyTagFrameDelay,PropertyTagTypeLong,sizeof(ULONG),&delay);
-  if(first->SaveAdd(x,&add)!=Ok){delete x;first->SaveAdd(EncoderValueFlush);delete first;return false;}delete x;
+  if(first->SaveAdd(x,&add)!=Ok){
+   delete x;
+   EncoderParameters flush{}; flush.Count=1;
+   flush.Parameter[0].Guid=EncoderSaveFlag;
+   flush.Parameter[0].Type=EncoderParameterValueTypeLong;
+   flush.Parameter[0].NumberOfValues=1;
+   ULONG fv=EncoderValueFlush; flush.Parameter[0].Value=&fv;
+   first->SaveAdd(&flush); delete first; return false;
+  }
+  delete x;
  }
- first->SaveAdd(EncoderValueFlush);delete first;
+ { EncoderParameters flush{}; flush.Count=1;
+   flush.Parameter[0].Guid=EncoderSaveFlag;
+   flush.Parameter[0].Type=EncoderParameterValueTypeLong;
+   flush.Parameter[0].NumberOfValues=1;
+   ULONG fv=EncoderValueFlush; flush.Parameter[0].Value=&fv;
+   first->SaveAdd(&flush); }
+ delete first;
  MessageBoxW(gWnd,(L"GIF exported:\n"+out).c_str(),L"Export GIF",MB_OK|MB_ICONINFORMATION);return true;
 }
 static std::wstring editText(HWND h){
  int n=GetWindowTextLengthW(h);if(n<=0)return L"";std::wstring s(n+1,L'\0');GetWindowTextW(h,&s[0],n+1);s.resize(n);return s;
 }
-static std::wstring editText(HWND h);\n\nstatic void layout(HWND h){
+static void layout(HWND h){
  RECT r{};GetClientRect(h,&r);int w=r.right,H=r.bottom;
  MoveWindow(gEdit,10,10,w-20,H-170,TRUE);
  MoveWindow(gLoad,10,H-150,100,30,TRUE);
@@ -284,7 +306,7 @@ static LRESULT CALLBACK wndProc(HWND h,UINT m,WPARAM w,LPARAM l){
   return 0;
  case WM_PAINT:{
   PAINTSTRUCT p{};HDC dc=BeginPaint(h,&p);RECT r{};GetClientRect(h,&r);
-  int ph=std::max(100,r.bottom-175);renderPreview(dc,r.right,ph);EndPaint(h,&p);return 0;}
+  int ph=(int)std::max<LONG>(100L,r.bottom-175);renderPreview(dc,r.right,ph);EndPaint(h,&p);return 0;}
  case WM_DESTROY:KillTimer(h,1);delete img;GdiplusShutdown(gdToken);PostQuitMessage(0);return 0;
  }
  return DefWindowProcW(h,m,w,l);
