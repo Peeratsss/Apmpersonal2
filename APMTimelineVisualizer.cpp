@@ -841,19 +841,180 @@ static void DrawKey(
 }
 
 // ============================================================
-// KEYBOARD
+// HAND-DRAWN / MS-PAINT STYLE KEYBOARD
 // ============================================================
+
+static unsigned int SketchSeed(const std::wstring& text, int x, int y)
+{
+    unsigned int seed = 2166136261u;
+
+    for (wchar_t c : text)
+    {
+        seed ^= static_cast<unsigned int>(c);
+        seed *= 16777619u;
+    }
+
+    seed ^= static_cast<unsigned int>(x * 31 + y * 17);
+    seed *= 16777619u;
+    return seed;
+}
+
+static int SketchJitter(unsigned int& seed, int amount)
+{
+    seed = seed * 1664525u + 1013904223u;
+    return static_cast<int>((seed >> 24) % (amount * 2 + 1)) - amount;
+}
+
+static void SketchLine(
+    HDC hdc,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    int width = 3
+)
+{
+    HPEN pen = CreatePen(
+        PS_SOLID,
+        width,
+        RGB(25, 25, 25)
+    );
+
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+
+    MoveToEx(hdc, x1, y1, nullptr);
+    LineTo(hdc, x2, y2);
+
+    SelectObject(hdc, oldPen);
+    DeleteObject(pen);
+}
+
+static void DrawSketchKey(
+    HDC hdc,
+    const std::wstring& name,
+    int x,
+    int y,
+    int width,
+    int height,
+    int fontSize = 17
+)
+{
+    const bool pressed = IsHeld(name);
+
+    unsigned int seed = SketchSeed(name, x, y);
+
+    const int j1 = SketchJitter(seed, 3);
+    const int j2 = SketchJitter(seed, 3);
+    const int j3 = SketchJitter(seed, 3);
+    const int j4 = SketchJitter(seed, 3);
+
+    const int x1 = x + j1;
+    const int y1 = y + j2;
+    const int x2 = x + width + j3;
+    const int y2 = y + height + j4;
+
+    // Cheap-looking white MS Paint fill.
+    HBRUSH fill = CreateSolidBrush(
+        pressed
+            ? RGB(175, 215, 255)
+            : RGB(245, 245, 238)
+    );
+
+    HPEN outline = CreatePen(
+        PS_SOLID,
+        3,
+        RGB(25, 25, 25)
+    );
+
+    HGDIOBJ oldBrush = SelectObject(hdc, fill);
+    HGDIOBJ oldPen = SelectObject(hdc, outline);
+
+    POINT points[4];
+
+    points[0] = { x1, y1 };
+    points[1] = { x2, y1 + SketchJitter(seed, 2) };
+    points[2] = { x2 + SketchJitter(seed, 2), y2 };
+    points[3] = { x1 + SketchJitter(seed, 2), y2 + SketchJitter(seed, 2) };
+
+    Polygon(hdc, points, 4);
+
+    // Double scribbled outline, deliberately imperfect.
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        int ox = pass == 0 ? 1 : -1;
+        int oy = pass == 0 ? -1 : 2;
+
+        MoveToEx(hdc, x1 + ox, y1 + oy, nullptr);
+        LineTo(hdc, x2 + SketchJitter(seed, 2), y1 + SketchJitter(seed, 2));
+        LineTo(hdc, x2 + SketchJitter(seed, 2), y2 + SketchJitter(seed, 2));
+        LineTo(hdc, x1 + SketchJitter(seed, 2), y2 + SketchJitter(seed, 2));
+        LineTo(hdc, x1 + ox, y1 + oy);
+    }
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+
+    DeleteObject(outline);
+    DeleteObject(fill);
+
+    // Slightly messy handwritten-style label.
+    HFONT font = CreateFontW(
+        fontSize,
+        0,
+        SketchJitter(seed, 2),
+        0,
+        FW_BOLD,
+        FALSE,
+        FALSE,
+        FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE,
+        L"Comic Sans MS"
+    );
+
+    HGDIOBJ oldFont = SelectObject(hdc, font);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(20, 20, 20));
+
+    RECT textRect{
+        x1 + 3,
+        y1 + 2,
+        x2 - 2,
+        y2 - 2
+    };
+
+    DrawTextW(
+        hdc,
+        name.c_str(),
+        -1,
+        &textRect,
+        DT_CENTER |
+        DT_VCENTER |
+        DT_SINGLELINE
+    );
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(font);
+}
 
 static void DrawKeyboard(
     HDC hdc
 )
 {
-    const int keyW = 70;
-    const int keyH = 62;
+    // Deliberately crude, MS-Paint-like keyboard.
+    // It is only used in the final GIF, never in the visualizer UI.
+    const int keyW = 72;
+    const int keyH = 55;
     const int gap = 8;
 
-    const int startX = 300;
-    const int startY = 390;
+    const int startX = 115;
+    const int startY = 365;
 
     const wchar_t* numbers[] =
     {
@@ -863,13 +1024,14 @@ static void DrawKeyboard(
 
     for (int i = 0; i < 10; ++i)
     {
-        DrawKey(
+        DrawSketchKey(
             hdc,
             numbers[i],
             startX + i * (keyW + gap),
             startY,
             keyW,
-            keyH
+            keyH,
+            16
         );
     }
 
@@ -881,13 +1043,14 @@ static void DrawKeyboard(
 
     for (int i = 0; i < 10; ++i)
     {
-        DrawKey(
+        DrawSketchKey(
             hdc,
             qrow[i],
             startX + 30 + i * (keyW + gap),
             startY + keyH + gap,
             keyW,
-            keyH
+            keyH,
+            16
         );
     }
 
@@ -899,13 +1062,14 @@ static void DrawKeyboard(
 
     for (int i = 0; i < 9; ++i)
     {
-        DrawKey(
+        DrawSketchKey(
             hdc,
             arow[i],
             startX + 65 + i * (keyW + gap),
             startY + 2 * (keyH + gap),
             keyW,
-            keyH
+            keyH,
+            16
         );
     }
 
@@ -917,187 +1081,383 @@ static void DrawKeyboard(
 
     for (int i = 0; i < 7; ++i)
     {
-        DrawKey(
+        DrawSketchKey(
             hdc,
             zrow[i],
             startX + 105 + i * (keyW + gap),
             startY + 3 * (keyH + gap),
             keyW,
-            keyH
+            keyH,
+            16
         );
     }
 
-    DrawKey(
+    DrawSketchKey(
         hdc,
         L"Space",
         startX + 180,
         startY + 4 * (keyH + gap),
         500,
-        keyH
-    );
-
-    DrawKey(
-        hdc,
-        L"Left Ctrl",
-        startX - 110,
-        startY + 4 * (keyH + gap),
-        110,
         keyH,
-        15
+        17
     );
 
-    DrawKey(
+    DrawSketchKey(
         hdc,
-        L"Left Shift",
-        startX - 30,
+        L"Ctrl",
+        startX - 105,
+        startY + 4 * (keyH + gap),
+        100,
+        keyH,
+        14
+    );
+
+    DrawSketchKey(
+        hdc,
+        L"Shift",
+        startX - 35,
         startY + 3 * (keyH + gap),
         125,
         keyH,
-        15
+        14
     );
 
-    DrawKey(
+    DrawSketchKey(
         hdc,
-        L"Left Alt",
-        startX + 55,
+        L"Alt",
+        startX + 60,
         startY + 4 * (keyH + gap),
-        110,
+        100,
         keyH,
-        15
+        14
     );
 
-    DrawKey(
+    DrawSketchKey(
         hdc,
         L"Enter",
-        startX + 9 * (keyW + gap) - 15,
+        startX + 9 * (keyW + gap) - 10,
         startY + 2 * (keyH + gap),
-        125,
+        120,
         keyH,
-        16
+        14
     );
 }
 
 // ============================================================
-// MOUSE
+// HAND-DRAWN / MS-PAINT STYLE MOUSE
 // ============================================================
+
+static void PaintText(HDC hdc, const std::wstring& text, int x, int y, int w, int h, int size, bool bold = false);
 
 static void DrawMouse(
     HDC hdc
 )
 {
-    const int x = 1250;
+    const int x = 1080;
     const int y = 430;
 
-    bool left =
-        IsHeld(L"LMB");
+    const bool left = IsHeld(L"LMB");
+    const bool right = IsHeld(L"RMB");
 
-    bool right =
-        IsHeld(L"RMB");
+    // Mouse body: intentionally crude and slightly asymmetrical.
+    POINT body[12] =
+    {
+        { x + 65,  y },
+        { x + 185, y + 5 },
+        { x + 220, y + 50 },
+        { x + 225, y + 205 },
+        { x + 205, y + 280 },
+        { x + 160, y + 315 },
+        { x + 90,  y + 318 },
+        { x + 35,  y + 280 },
+        { x + 15,  y + 205 },
+        { x + 20,  y + 55 },
+        { x + 38,  y + 18 },
+        { x + 65,  y }
+    };
 
-    FillRectColor(
-        hdc,
-        x,
-        y,
-        x + 250,
-        y + 330,
-        RGB(45, 45, 50)
+    HBRUSH bodyBrush = CreateSolidBrush(RGB(245, 245, 238));
+    HPEN bodyPen = CreatePen(PS_SOLID, 4, RGB(20, 20, 20));
+
+    HGDIOBJ oldBrush = SelectObject(hdc, bodyBrush);
+    HGDIOBJ oldPen = SelectObject(hdc, bodyPen);
+
+    Polygon(hdc, body, 12);
+
+    SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+    // Scribbled second outline.
+    MoveToEx(hdc, x + 62, y + 3, nullptr);
+    LineTo(hdc, x + 183, y + 8);
+    LineTo(hdc, x + 217, y + 52);
+    LineTo(hdc, x + 220, y + 205);
+    LineTo(hdc, x + 200, y + 278);
+    LineTo(hdc, x + 155, y + 311);
+
+    MoveToEx(hdc, x + 30, y + 62, nullptr);
+    LineTo(hdc, x + 25, y + 205);
+    LineTo(hdc, x + 42, y + 273);
+    LineTo(hdc, x + 92, y + 311);
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+
+    DeleteObject(bodyPen);
+    DeleteObject(bodyBrush);
+
+    // Left/right click areas.
+    HBRUSH leftBrush = CreateSolidBrush(
+        left ? RGB(175, 215, 255) : RGB(235, 235, 228)
+    );
+    HBRUSH rightBrush = CreateSolidBrush(
+        right ? RGB(175, 215, 255) : RGB(235, 235, 228)
     );
 
-    HPEN pen =
-        CreatePen(
-            PS_SOLID,
-            4,
-            RGB(120, 120, 125)
-        );
+    RECT leftRect{ x + 35, y + 35, x + 115, y + 125 };
+    RECT rightRect{ x + 120, y + 35, x + 205, y + 125 };
 
-    HGDIOBJ oldPen =
-        SelectObject(
-            hdc,
-            pen
-        );
-
-    HGDIOBJ oldBrush =
-        SelectObject(
-            hdc,
-            GetStockObject(NULL_BRUSH)
-        );
-
-    RoundRect(
+    FillRect(
         hdc,
-        x,
-        y,
-        x + 250,
-        y + 330,
-        70,
-        70
+        &leftRect,
+        leftBrush
     );
 
-    SelectObject(
+    FillRect(
         hdc,
-        oldBrush
+        &rightRect,
+        rightBrush
     );
 
-    SelectObject(
-        hdc,
-        oldPen
-    );
+    DeleteObject(leftBrush);
+    DeleteObject(rightBrush);
 
-    DeleteObject(pen);
+    SketchLine(hdc, x + 118, y + 35, x + 118, y + 130, 3);
+    SketchLine(hdc, x + 35, y + 130, x + 205, y + 130, 3);
 
-    FillRectColor(
-        hdc,
-        x + 15,
-        y + 15,
-        x + 118,
-        y + 155,
-        left
-            ? RGB(255, 170, 40)
-            : RGB(70, 70, 75)
-    );
+    // Wheel / center scribble.
+    SketchLine(hdc, x + 120, y + 55, x + 120, y + 105, 5);
+    SketchLine(hdc, x + 115, y + 75, x + 125, y + 75, 3);
 
-    FillRectColor(
-        hdc,
-        x + 132,
-        y + 15,
-        x + 235,
-        y + 155,
-        right
-            ? RGB(255, 170, 40)
-            : RGB(70, 70, 75)
-    );
-
-    DrawCenteredText(
+    PaintText(
         hdc,
         L"LMB",
-        x + 15,
-        y + 30,
-        x + 118,
-        y + 140,
-        25,
+        x + 32,
+        y + 55,
+        85,
+        55,
+        18,
         true
     );
 
-    DrawCenteredText(
+    PaintText(
         hdc,
         L"RMB",
-        x + 132,
-        y + 30,
-        x + 235,
-        y + 140,
-        25,
+        x + 120,
+        y + 55,
+        88,
+        55,
+        18,
         true
     );
 
-    DrawCenteredText(
+    PaintText(
         hdc,
-        L"MOUSE",
-        x,
-        y + 180,
-        x + 250,
-        y + 240,
-        24,
+        L"mouse",
+        x + 48,
+        y + 205,
+        125,
+        45,
+        20,
         true
     );
+
+    // The deliberately bad side buttons.
+    SketchLine(hdc, x + 15, y + 155, x - 18, y + 145, 4);
+    SketchLine(hdc, x - 18, y + 145, x - 28, y + 165, 4);
+    SketchLine(hdc, x - 27, y + 165, x + 12, y + 175, 4);
+
+    PaintText(
+        hdc,
+        L"side btns",
+        x - 90,
+        y + 175,
+        95,
+        30,
+        11,
+        false
+    );
+}
+
+// ============================================================
+// PAINT-STYLE FINAL GIF PANEL
+// ============================================================
+
+static void PaintText(HDC hdc, const std::wstring& text, int x, int y, int w, int h, int size, bool bold = false)
+{
+    DrawCenteredText(hdc, text, x, y, x + w, y + h, size, bold);
+}
+
+static void DrawPaintWindow(HDC hdc)
+{
+    const int x = 1010;
+    const int y = 105;
+    const int w = 820;
+    const int h = 830;
+
+    // Outer window.
+    FillRectColor(hdc, x, y, x + w, y + h, RGB(242, 242, 242));
+
+    HPEN border = CreatePen(PS_SOLID, 2, RGB(125, 125, 130));
+    HGDIOBJ oldPen = SelectObject(hdc, border);
+    HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, x, y, x + w, y + h);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(border);
+
+    // Windows-style title bar.
+    FillRectColor(hdc, x + 2, y + 2, x + w - 2, y + 42, RGB(250, 250, 250));
+    PaintText(hdc, L"Untitled - Paint", x + 18, y + 7, 240, 28, 17, false);
+
+    PaintText(hdc, L"—", x + w - 115, y + 4, 32, 30, 18, false);
+    PaintText(hdc, L"□", x + w - 78, y + 4, 32, 30, 16, false);
+    PaintText(hdc, L"×", x + w - 42, y + 3, 32, 30, 18, false);
+
+    // Ribbon tabs.
+    FillRectColor(hdc, x + 2, y + 42, x + w - 2, y + 78, RGB(248, 248, 248));
+    FillRectColor(hdc, x + 12, y + 43, x + 74, y + 77, RGB(230, 230, 230));
+    PaintText(hdc, L"Home", x + 12, y + 45, 62, 28, 15, true);
+
+    // Ribbon body.
+    FillRectColor(hdc, x + 2, y + 78, x + w - 2, y + 205, RGB(245, 245, 245));
+
+    // Ribbon groups.
+    const int gy = y + 87;
+    const int gh = 92;
+
+    // Clipboard.
+    PaintText(hdc, L"Clipboard", x + 15, y + 174, 105, 18, 12, false);
+    PaintText(hdc, L"Paste", x + 18, gy + 12, 58, 28, 13, true);
+    PaintText(hdc, L"Cut", x + 78, gy + 12, 42, 28, 12, false);
+    PaintText(hdc, L"Copy", x + 78, gy + 42, 48, 28, 12, false);
+
+    // Image.
+    PaintText(hdc, L"Image", x + 145, y + 174, 100, 18, 12, false);
+    const wchar_t* imageTools[] = { L"Select", L"Crop", L"Resize", L"Rotate" };
+    for (int i = 0; i < 4; ++i)
+        PaintText(hdc, imageTools[i], x + 135 + i * 58, gy + 18, 55, 30, 11, false);
+
+    // Tools.
+    PaintText(hdc, L"Tools", x + 390, y + 174, 70, 18, 12, false);
+    const wchar_t* tools[] = { L"✎", L"▣", L"A", L"⌫", L"◉", L"⌕", L"Brush" };
+    for (int i = 0; i < 7; ++i)
+        PaintText(hdc, tools[i], x + 365 + i * 55, gy + 15, 48, 35, i == 6 ? 10 : 17, false);
+
+    // Shapes.
+    PaintText(hdc, L"Shapes", x + 390, y + 174, 70, 18, 12, false);
+    for (int i = 0; i < 5; ++i)
+    {
+        HPEN shapePen = CreatePen(PS_SOLID, 2, RGB(70, 70, 75));
+        HGDIOBJ old = SelectObject(hdc, shapePen);
+        int sx = x + 365 + i * 55;
+        int sy = gy + 53;
+        if (i == 0) LineTo(hdc, sx + 35, sy + 20);
+        else if (i == 1) Rectangle(hdc, sx, sy, sx + 35, sy + 22);
+        else if (i == 2) Ellipse(hdc, sx, sy, sx + 35, sy + 22);
+        else if (i == 3) { MoveToEx(hdc, sx, sy + 22, nullptr); LineTo(hdc, sx + 18, sy); LineTo(hdc, sx + 36, sy + 22); }
+        else { MoveToEx(hdc, sx, sy + 22, nullptr); LineTo(hdc, sx + 18, sy); LineTo(hdc, sx + 36, sy + 22); }
+        SelectObject(hdc, old);
+        DeleteObject(shapePen);
+    }
+
+    // Colors.
+    PaintText(hdc, L"Colors", x + 650, y + 174, 80, 18, 12, false);
+    PaintText(hdc, L"Color 1", x + 620, gy + 5, 65, 18, 10, false);
+    PaintText(hdc, L"Color 2", x + 685, gy + 5, 65, 18, 10, false);
+    FillRectColor(hdc, x + 625, gy + 25, x + 650, gy + 50, RGB(0, 0, 0));
+    FillRectColor(hdc, x + 690, gy + 25, x + 715, gy + 50, RGB(255, 255, 255));
+    const COLORREF palette[] = {
+        RGB(0,0,0), RGB(128,128,128), RGB(128,0,0), RGB(255,0,0),
+        RGB(128,128,0), RGB(255,255,0), RGB(0,128,0), RGB(0,255,0),
+        RGB(0,128,128), RGB(0,255,255), RGB(0,0,128), RGB(0,0,255),
+        RGB(128,0,128), RGB(255,0,255), RGB(128,64,0), RGB(255,255,255)
+    };
+    for (int i = 0; i < 16; ++i)
+    {
+        int px = x + 625 + (i % 8) * 20;
+        int py = gy + 58 + (i / 8) * 20;
+        FillRectColor(hdc, px, py, px + 18, py + 18, palette[i]);
+    }
+
+    // Canvas area.
+    const int cx = x + 25;
+    const int cy = y + 225;
+    const int cw = w - 50;
+    const int ch = h - 275;
+
+    FillRectColor(hdc, cx, cy, cx + cw, cy + ch, RGB(255, 255, 255));
+
+    HPEN canvasBorder = CreatePen(PS_SOLID, 1, RGB(190, 190, 190));
+    HGDIOBJ oldCanvasPen = SelectObject(hdc, canvasBorder);
+    HGDIOBJ oldCanvasBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, cx, cy, cx + cw, cy + ch);
+    SelectObject(hdc, oldCanvasBrush);
+    SelectObject(hdc, oldCanvasPen);
+    DeleteObject(canvasBorder);
+
+    // Handwritten-style wireframe sketches.
+    HPEN ink = CreatePen(PS_SOLID, 3, RGB(25, 25, 25));
+    HGDIOBJ oldInk = SelectObject(hdc, ink);
+    HGDIOBJ oldInkBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+    // F keys / Esc.
+    Rectangle(hdc, cx + 35, cy + 35, cx + 350, cy + 105);
+    Rectangle(hdc, cx + 55, cy + 50, cx + 120, cy + 92);
+    PaintText(hdc, L"Esc", cx + 58, cy + 52, 60, 36, 13, false);
+    PaintText(hdc, L"F keys", cx + 145, cy + 52, 110, 34, 15, false);
+
+    // Keyboard.
+    Rectangle(hdc, cx + 35, cy + 145, cx + 505, cy + 310);
+    PaintText(hdc, L"Keyboard", cx + 145, cy + 205, 250, 48, 24, false);
+
+    // Mouse sketch.
+    Rectangle(hdc, cx + 570, cy + 35, cx + 750, cy + 205);
+    MoveToEx(hdc, cx + 570, cy + 115, nullptr);
+    LineTo(hdc, cx + 750, cy + 115);
+    MoveToEx(hdc, cx + 660, cy + 115, nullptr);
+    LineTo(hdc, cx + 660, cy + 205);
+    PaintText(hdc, L"Mouse", cx + 595, cy + 65, 130, 38, 18, false);
+    PaintText(hdc, L"2 side buttons", cx + 425, cy + 45, 135, 35, 13, false);
+    PaintText(hdc, L"general layout", cx + 500, cy + 10, 160, 30, 13, false);
+
+    // QWERTY / border sketch.
+    Rectangle(hdc, cx + 35, cy + 360, cx + 505, cy + 470);
+    PaintText(hdc, L"Q W E R T Y", cx + 55, cy + 390, 190, 38, 18, false);
+    PaintText(hdc, L"U", cx + 285, cy + 390, 40, 38, 18, false);
+    PaintText(hdc, L"no border", cx + 45, cy + 325, 120, 30, 13, false);
+    PaintText(hdc, L"border", cx + 280, cy + 325, 90, 30, 13, false);
+    PaintText(hdc, L"stylize border", cx + 380, cy + 480, 120, 30, 13, false);
+
+    // Bottom-right sketch.
+    Rectangle(hdc, cx + 570, cy + 330, cx + 735, cy + 485);
+    Rectangle(hdc, cx + 545, cy + 370, cx + 580, cy + 420);
+    MoveToEx(hdc, cx + 660, cy + 330, nullptr);
+    LineTo(hdc, cx + 660, cy + 385);
+    MoveToEx(hdc, cx + 660, cy + 385, nullptr);
+    LineTo(hdc, cx + 720, cy + 385);
+    // Scribble.
+    for (int i = 0; i < 7; ++i)
+    {
+        MoveToEx(hdc, cx + 655 + i * 3, cy + 378, nullptr);
+        LineTo(hdc, cx + 690 - i * 2, cy + 398);
+    }
+
+    SelectObject(hdc, oldInkBrush);
+    SelectObject(hdc, oldInk);
+    DeleteObject(ink);
+
+    PaintText(hdc, L"646, 209px", cx + 5, cy + ch - 28, 110, 20, 10, false);
+    PaintText(hdc, L"1750 x 2000px", cx + cw - 135, cy + ch - 28, 130, 20, 10, false);
 }
 
 // ============================================================
@@ -1107,7 +1467,8 @@ static void DrawMouse(
 static void RenderScene(
     HDC hdc,
     int width,
-    int height
+    int height,
+    bool includeInputVisualizer
 )
 {
     FillRectColor(
@@ -1161,8 +1522,11 @@ static void RenderScene(
         false
     );
 
-    DrawKeyboard(hdc);
-    DrawMouse(hdc);
+    if (includeInputVisualizer)
+    {
+        DrawKeyboard(hdc);
+        DrawMouse(hdc);
+    }
 
     const int barX = 250;
     const int barY = 920;
@@ -1424,8 +1788,13 @@ static Bitmap* RenderGIFFrame(
     RenderScene(
         videoDC,
         VIDEO_WIDTH,
-        VIDEO_HEIGHT
+        VIDEO_HEIGHT,
+        true
     );
+
+    // The keyboard is intentionally rendered only for the final GIF.
+    // The interactive visualizer window itself stays lightweight.
+    DrawPaintWindow(videoDC);
 
     Bitmap source(
         videoBitmap,
@@ -1475,7 +1844,28 @@ static Bitmap* RenderGIFFrame(
         return nullptr;
     }
 
-    return frame;
+    // GDI+ is much more reliable for animated GIFs when every
+    // frame is an 8-bit indexed bitmap.  A 32-bit ARGB bitmap can
+    // save successfully as a GIF but may silently produce a
+    // single-frame GIF when used with SaveAdd.
+    Bitmap* indexedFrame =
+        frame->Clone(
+            0,
+            0,
+            outputWidth,
+            outputHeight,
+            PixelFormat8bppIndexed
+        );
+
+    if (!indexedFrame || indexedFrame->GetLastStatus() != Ok)
+    {
+        delete indexedFrame;
+        delete frame;
+        return nullptr;
+    }
+
+    delete frame;
+    return indexedFrame;
 }
 
 static bool ExportGIF()
@@ -1573,6 +1963,48 @@ static bool ExportGIF()
 
     playing = false;
 
+    // --------------------------------------------------------
+    // Create ONE canonical neutral frame.
+    //
+    // Whenever no keyboard/mouse input is held during export,
+    // this exact same image is reused.  We do not redraw the
+    // neutral scene for every idle interval.  The GIF delay is
+    // what represents the amount of time spent idle.
+    // --------------------------------------------------------
+    ResetPlaybackState();
+    currentTime = 0.0;
+
+    Bitmap* neutralFrame =
+        RenderGIFFrame(
+            videoDC,
+            videoBitmap,
+            outputWidth,
+            outputHeight
+        );
+
+    if (!neutralFrame)
+    {
+        SelectObject(
+            videoDC,
+            oldBitmap
+        );
+
+        DeleteObject(videoBitmap);
+        DeleteDC(videoDC);
+
+        currentTime = savedTime;
+        playing = savedPlaying;
+
+        MessageBoxW(
+            hwndMain,
+            L"Could not create the neutral GIF frame.",
+            L"GIF Export Failed",
+            MB_OK | MB_ICONERROR
+        );
+
+        return false;
+    }
+
     std::vector<double> frameTimes;
 
     // The GIF only gets a new frame when the input state changes.
@@ -1603,6 +2035,7 @@ static bool ExportGIF()
     );
 
     Bitmap* firstFrame = nullptr;
+    size_t neutralFrameUses = 0;
 
     EncoderParameters saveParameters{};
 
@@ -1638,13 +2071,30 @@ static bool ExportGIF()
             currentTime
         );
 
-        Bitmap* frame =
-            RenderGIFFrame(
-                videoDC,
-                videoBitmap,
-                outputWidth,
-                outputHeight
-            );
+        // If nothing is currently held, reuse the one canonical
+        // neutral image instead of rendering another identical
+        // bitmap.  This makes idle periods act as a buffer between
+        // active input states.
+        const bool isNeutral =
+            heldKeys.empty();
+
+        Bitmap* frame = nullptr;
+
+        if (isNeutral)
+        {
+            frame = neutralFrame;
+            ++neutralFrameUses;
+        }
+        else
+        {
+            frame =
+                RenderGIFFrame(
+                    videoDC,
+                    videoBitmap,
+                    outputWidth,
+                    outputHeight
+                );
+        }
 
         if (!frame)
         {
@@ -1705,7 +2155,8 @@ static bool ExportGIF()
             )
             {
                 success = false;
-                delete firstFrame;
+                if (firstFrame != neutralFrame)
+                    delete firstFrame;
                 firstFrame = nullptr;
                 break;
             }
@@ -1739,11 +2190,13 @@ static bool ExportGIF()
             )
             {
                 success = false;
-                delete frame;
+                if (!isNeutral)
+                    delete frame;
                 break;
             }
 
-            delete frame;
+            if (!isNeutral)
+                delete frame;
         }
     }
 
@@ -1780,8 +2233,15 @@ static bool ExportGIF()
             success = false;
         }
 
-        delete firstFrame;
+        if (firstFrame != neutralFrame)
+            delete firstFrame;
         firstFrame = nullptr;
+    }
+
+    if (neutralFrame)
+    {
+        delete neutralFrame;
+        neutralFrame = nullptr;
     }
 
     SelectObject(
@@ -1824,7 +2284,8 @@ static bool ExportGIF()
             L"x" +
             std::to_wstring(outputHeight) +
             L"\\n\\n"
-            L"Frames are created only when the input state changes.";
+            L"Frames are created only when the input state changes.\n"
+            L"Idle periods reuse one canonical neutral frame.";
 
         MessageBoxW(
             hwndMain,
@@ -2275,10 +2736,13 @@ static LRESULT CALLBACK WindowProc(
                         currentTime
                     );
 
+                    // Preview intentionally contains no keyboard/mouse visualizer.
+                    // Those controls are rendered only into the exported GIF.
                     RenderScene(
                         memDC,
                         previewWidth,
-                        previewHeight
+                        previewHeight,
+                        false
                     );
 
                     BitBlt(
