@@ -1,9 +1,9 @@
-#define WIN32_LEAN_AND_MEAN
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
 
 #include <windows.h>
+#include <objidl.h>
 #include <gdiplus.h>
 
 #include <string>
