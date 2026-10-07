@@ -9,6 +9,8 @@
 #include <wincodec.h>
 #include <gdiplus.h>
 
+using namespace Gdiplus;
+
 #include <string>
 #include <vector>
 #include <algorithm>
