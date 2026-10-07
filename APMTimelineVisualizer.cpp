@@ -5,2022 +5,306 @@
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
-
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <sstream>
 #include <cwctype>
 #include <cmath>
-#include <cstdio>
 
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "gdiplus.lib")
-
+#pragma comment(lib,"user32.lib")
+#pragma comment(lib,"gdi32.lib")
+#pragma comment(lib,"gdiplus.lib")
 using namespace Gdiplus;
 
-// ============================================================
-// SETTINGS
-// ============================================================
+static const int GW=1200, GH=300, FPS=50;
+static const COLORREF PURPLE=RGB(162,73,245);
+static const COLORREF GREEN=RGB(0,255,0);
+static HWND gWnd,gEdit,gLoad,gPlay,gReset,gExport;
+static ULONG_PTR gdToken;
+static Bitmap* img=nullptr;
+static UINT iw=0,ih=0;
+static LARGE_INTEGER pf{},playStart{};
+static bool playing=false;
+static double nowTime=0, lengthSec=.5, playOrigin=0;
+static size_t eventPos=0;
+struct Ev{double t;std::wstring name;bool down;};
+static std::vector<Ev> evs;
+static std::vector<std::wstring> held;
 
-static const int GIF_WIDTH = 1200;
-static const int GIF_HEIGHT = 300;
-static const int FPS = 60;
-static const int DEFAULT_WIDTH = 1100;
-static const int DEFAULT_HEIGHT = 850;
-static const UINT TIMER_PREVIEW = 1;
-static const wchar_t* ARTWORK_FILE = L"image.png";
+static std::wstring trim(std::wstring s){
+ size_t a=0,b=s.size(); while(a<b&&iswspace(s[a]))a++; while(b>a&&iswspace(s[b-1]))b--;
+ return s.substr(a,b-a);
+}
+static std::wstring upper(std::wstring s){for(auto&c:s)c=towupper(c);return s;}
+static std::wstring exeDir(){
+ wchar_t p[MAX_PATH]{}; GetModuleFileNameW(nullptr,p,MAX_PATH); std::wstring s=p;
+ size_t x=s.find_last_of(L"\\/"); if(x!=std::wstring::npos)s.resize(x); return s;
+}
+static std::wstring imagePath(){return exeDir()+L"\\image.png";}
 
-// ============================================================
-// EVENT
-// ============================================================
+static bool parseTimeline(const std::wstring& text){
+ std::vector<Ev> v; std::wstringstream all(text); std::wstring line; double t=0;
+ while(std::getline(all,line)){
+  line=trim(line); if(line.empty()||line[0]==L'#')continue;
+  std::wstringstream ss(line); double ms;
+  if(!(ss>>ms)||ms<0)return false;
+  std::wstring n; std::getline(ss,n); n=trim(n);
+  if(n.size()<2)return false;
+  wchar_t sign=n.back(); if(sign!=L'+'&&sign!=L'-')return false;
+  n=trim(n.substr(0,n.size()-1)); if(n.empty())return false;
+  t+=ms/1000.0; v.push_back({t,n,sign==L'+'});
+ }
+ if(v.empty())return false;
+ evs=std::move(v); lengthSec=std::max(.5,evs.back().t+.5);
+ nowTime=0;eventPos=0;held.clear();return true;
+}
+static void setHeld(const std::wstring& n,bool down){
+ std::wstring u=upper(n); auto it=std::find(held.begin(),held.end(),u);
+ if(down){if(it==held.end())held.push_back(u);}
+ else if(it!=held.end())held.erase(it);
+}
+static bool isHeld(const std::wstring& n){
+ return std::find(held.begin(),held.end(),upper(n))!=held.end();
+}
+static void resetState(){held.clear();eventPos=0;}
+static void processTo(double t){
+ while(eventPos<evs.size()&&evs[eventPos].t<=t+1e-9){
+  setHeld(evs[eventPos].name,evs[eventPos].down);eventPos++;
+ }
+}
+static int apm(double t){
+ int n=0;double s=t-60;
+ for(auto&e:evs){if(e.t>t)break;if(e.down&&e.t>=s)n++;}
+ return n;
+}
+static std::vector<std::wstring> last10(double t){
+ std::vector<std::wstring> r;
+ for(auto i=evs.rbegin();i!=evs.rend();++i){
+  if(i->t>t)continue;if(!i->down)continue;r.push_back(i->name);if(r.size()==10)break;
+ }
+ std::reverse(r.begin(),r.end());return r;
+}
+static void text(HDC dc,const std::wstring&s,int l,int t,int r,int b,int size,bool bold,COLORREF c){
+ HFONT f=CreateFontW(-size,0,0,0,bold?FW_BOLD:FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+  OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Arial");
+ HFONT old=(HFONT)SelectObject(dc,f);SetBkMode(dc,TRANSPARENT);SetTextColor(dc,c);
+ RECT q{l,t,r,b};DrawTextW(dc,s.c_str(),-1,&q,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+ SelectObject(dc,old);DeleteObject(f);
+}
+static bool loadImage(){
+ if(img)return true;
+ img=new Bitmap(imagePath().c_str(),FALSE);
+ if(!img||img->GetLastStatus()!=Ok){delete img;img=nullptr;return false;}
+ iw=img->GetWidth();ih=img->GetHeight();return iw&&ih;
+}
 
-struct TimelineEvent
-{
-    double time = 0.0;       // seconds from the beginning
-    std::wstring name;
-    bool down = true;        // true = press, false = release
+struct R{const wchar_t*n;float l,t,r,b;};
+#define K(n,l,t,r,b) {L##n,l,t,r,b}
+static const R regions[]={
+ K("ESC",.070,.285,.105,.390),K("F1",.102,.285,.135,.390),K("F2",.132,.285,.165,.390),
+ K("F3",.162,.285,.195,.390),K("F4",.192,.285,.225,.390),K("F5",.222,.285,.255,.390),
+ K("F6",.252,.285,.285,.390),K("F7",.282,.285,.315,.390),K("F8",.312,.285,.345,.390),
+ K("F9",.342,.285,.375,.390),K("F10",.372,.285,.410,.390),K("F11",.407,.285,.445,.390),
+ K("F12",.442,.285,.480,.390),
+
+ K("`",.068,.410,.105,.535),K("1",.102,.410,.132,.535),K("2",.130,.410,.160,.535),
+ K("3",.158,.410,.188,.535),K("4",.186,.410,.216,.535),K("5",.214,.410,.244,.535),
+ K("6",.242,.410,.272,.535),K("7",.270,.410,.300,.535),K("8",.298,.410,.328,.535),
+ K("9",.326,.410,.356,.535),K("0",.354,.410,.384,.535),K("-",.382,.410,.412,.535),
+ K("=",.410,.410,.440,.535),K("BACKSPACE",.438,.410,.480,.535),
+
+ K("TAB",.068,.535,.112,.655),K("Q",.110,.535,.140,.655),K("W",.138,.535,.168,.655),
+ K("E",.166,.535,.196,.655),K("R",.194,.535,.224,.655),K("T",.222,.535,.252,.655),
+ K("Y",.250,.535,.280,.655),K("U",.278,.535,.308,.655),K("I",.306,.535,.336,.655),
+ K("O",.334,.535,.364,.655),K("P",.362,.535,.392,.655),K("[",.390,.535,.420,.655),
+ K("]",.418,.535,.448,.655),K("\\",.446,.535,.480,.655),
+
+ K("CAPS",.068,.655,.120,.775),K("A",.118,.655,.148,.775),K("S",.146,.655,.176,.775),
+ K("D",.174,.655,.204,.775),K("F",.202,.655,.232,.775),K("G",.230,.655,.260,.775),
+ K("H",.258,.655,.288,.775),K("J",.286,.655,.316,.775),K("K",.314,.655,.344,.775),
+ K("L",.342,.655,.372,.775),K(";",.370,.655,.400,.775),K("'",.398,.655,.428,.775),
+ K("ENTER",.426,.655,.480,.775),
+
+ K("SHIFT",.068,.775,.125,.895),K("Z",.123,.775,.153,.895),K("X",.151,.775,.181,.895),
+ K("C",.179,.775,.209,.895),K("V",.207,.775,.237,.895),K("B",.235,.775,.265,.895),
+ K("N",.263,.775,.293,.895),K("M",.291,.775,.321,.895),K(",",.319,.775,.349,.895),
+ K(".",.347,.775,.377,.895),K("/",.375,.775,.405,.895),K("RSHIFT",.403,.775,.480,.895),
+
+ K("CTRL",.068,.895,.115,.980),K("WIN",.113,.895,.145,.980),K("ALT",.143,.895,.175,.980),
+ K("SPACE",.173,.895,.375,.980),K("RALT",.373,.895,.405,.980),K("RCTRL",.403,.895,.440,.980),
+
+ K("UP",.365,.755,.405,.825),K("LEFT",.325,.825,.365,.895),
+ K("DOWN",.365,.825,.405,.895),K("RIGHT",.405,.825,.445,.895),
+
+ K("LMB",.840,.395,.875,.575),K("RMB",.875,.395,.910,.575),
+ K("MMB",.855,.575,.895,.660),K("X1",.832,.535,.850,.660),K("X2",.900,.535,.918,.660)
 };
+#undef K
 
-// ============================================================
-// GLOBALS
-// ============================================================
-
-static HWND hwndMain = nullptr;
-static HWND hwndTimeline = nullptr;
-static HWND hwndSecondTimeline = nullptr;
-static HWND hwndLoad = nullptr;
-static HWND hwndPlay = nullptr;
-static HWND hwndReset = nullptr;
-static HWND hwndExportGIF = nullptr;
-
-static std::vector<TimelineEvent> events;
-static std::vector<std::wstring> heldKeys;
-static size_t processedEventIndex = 0;
-
-static double currentTime = 0.0;
-static double duration = 0.0;
-static bool playing = false;
-
-static LARGE_INTEGER performanceFrequency{};
-static LARGE_INTEGER playbackStartPerformance{};
-static double playbackStartTimelineTime = 0.0;
-
-static ULONG_PTR gdiplusToken = 0;
-static Bitmap* userImage = nullptr;
-static UINT userImageWidth = 0;
-static UINT userImageHeight = 0;
-
-// ============================================================
-// STRING HELPERS
-// ============================================================
-
-static std::wstring Trim(const std::wstring& input)
-{
-    size_t first = 0;
-    while (first < input.size() && iswspace(input[first]))
-        ++first;
-
-    size_t last = input.size();
-    while (last > first && iswspace(input[last - 1]))
-        --last;
-
-    return input.substr(first, last - first);
+static const R* regionFor(std::wstring n){
+ n=upper(trim(n));
+ if(n==L"ESCAPE")n=L"ESC";if(n==L"RETURN")n=L"ENTER";if(n==L"BACK")n=L"BACKSPACE";
+ if(n==L"LEFT SHIFT")n=L"SHIFT";if(n==L"RIGHT SHIFT")n=L"RSHIFT";
+ if(n==L"LEFT CTRL")n=L"CTRL";if(n==L"RIGHT CTRL")n=L"RCTRL";
+ if(n==L"LEFT ALT")n=L"ALT";if(n==L"RIGHT ALT")n=L"RALT";
+ if(n==L"ARROWUP")n=L"UP";if(n==L"ARROWDOWN")n=L"DOWN";
+ if(n==L"ARROWLEFT")n=L"LEFT";if(n==L"ARROWRIGHT")n=L"RIGHT";
+ for(auto&r:regions)if(n==upper(r.n))return&r;
+ return nullptr;
 }
-
-static std::wstring ToUpper(std::wstring value)
-{
-    for (wchar_t& c : value)
-        c = towupper(c);
-    return value;
+static bool green(BYTE r,BYTE g,BYTE b){
+ return g>100&&g>(BYTE)std::min(255,(int)(r*1.25))&&g>(BYTE)std::min(255,(int)(b*1.25));
 }
-
-static std::wstring NormalizeInputName(std::wstring name)
-{
-    return ToUpper(Trim(name));
+static void pressPixels(HDC dc,int w,int h,const R&r){
+ int l=std::max(0,(int)(r.l*w)),t=std::max(0,(int)(r.t*h));
+ int rr=std::min(w,(int)(r.r*w)),bb=std::min(h,(int)(r.b*h));
+ for(int y=t;y<bb;y++)for(int x=l;x<rr;x++){
+  COLORREF c=GetPixel(dc,x,y);if(c==CLR_INVALID)continue;
+  BYTE R8=GetRValue(c),G8=GetGValue(c),B8=GetBValue(c);
+  if(green(R8,G8,B8))continue;
+  if(R8>175&&G8>175&&B8>175)SetPixelV(dc,x,y,PURPLE);
+ }
 }
-
-// ============================================================
-// PATH
-// ============================================================
-
-static std::wstring GetExeDirectory()
-{
-    wchar_t path[MAX_PATH]{};
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-
-    std::wstring result(path);
-    size_t slash = result.find_last_of(L"\\/");
-
-    if (slash != std::wstring::npos)
-        result.resize(slash);
-
-    return result;
+static bool regionHeld(const R& r){
+ for(const auto& n:held)if(regionFor(n)==&r)return true;
+ return false;
 }
-
-static std::wstring ArtworkPath()
-{
-    return GetExeDirectory() + L"\\" + ARTWORK_FILE;
+static void drawPressed(HDC dc,int w,int h){
+ for(auto&r:regions)if(regionHeld(r))pressPixels(dc,w,h,r);
 }
-
-// ============================================================
-// FORWARD DECLARATIONS
-// ============================================================
-
-static void ResetPlaybackState();
-static void ProcessEventsTo(double targetTime);
-
-// ============================================================
-// DELTA TIMELINE PARSER
-//
-// ONLY accepts:
-//
-// 3234 S+
-// 94 S-
-// 203 T+
-// 109 T-
-// 0 A+
-// 157 R+
-//
-// The number is milliseconds since the PREVIOUS event.
-// '+' = press
-// '-' = release
-//
-// Names may contain spaces, e.g.
-// Num 1+
-// Num 1-
-// Space+
-// LMB+
-// ============================================================
-
-static bool ParseDeltaTimelineLine(
-    const std::wstring& line,
-    double& deltaMilliseconds,
-    std::wstring& inputName,
-    bool& down)
-{
-    std::wstring s = Trim(line);
-
-    if (s.empty())
-        return false;
-
-    if (s[0] == L'#')
-        return false;
-
-    // Find the first whitespace separating delta from input name.
-    size_t separator = 0;
-
-    while (separator < s.size() && !iswspace(s[separator]))
-        ++separator;
-
-    if (separator == 0 || separator >= s.size())
-        return false;
-
-    std::wstring deltaText = s.substr(0, separator);
-    std::wstring remainder = Trim(s.substr(separator));
-
-    if (remainder.empty())
-        return false;
-
-    // Delta must be a non-negative integer/decimal number.
-    wchar_t* endPtr = nullptr;
-    const double delta = wcstod(deltaText.c_str(), &endPtr);
-
-    if (endPtr == deltaText.c_str() || *endPtr != L'\0')
-        return false;
-
-    if (!std::isfinite(delta) || delta < 0.0)
-        return false;
-
-    // The final character is the press/release marker.
-    wchar_t marker = remainder.back();
-
-    if (marker != L'+' && marker != L'-')
-        return false;
-
-    down = (marker == L'+');
-
-    remainder.pop_back();
-    inputName = NormalizeInputName(remainder);
-
-    if (inputName.empty())
-        return false;
-
-    deltaMilliseconds = delta;
-    return true;
+static void dynamicInfo(HDC dc,int w,int h){
+ wchar_t b[32]{};swprintf_s(b,L"%d",apm(nowTime));
+ text(dc,b,(int)(w*.485),(int)(h*.365),(int)(w*.570),(int)(h*.500),24,true,RGB(0,0,0));
+ auto a=last10(nowTime);int y=(int)(h*.535);
+ for(size_t i=0;i<a.size();i++)text(dc,a[i],(int)(w*.495),y+(int)i*20,(int)(w*.675),y+(int)(i+1)*20,13,true,RGB(0,0,0));
 }
-
-static bool ParseTimeline(const std::wstring& text)
-{
-    std::vector<TimelineEvent> parsed;
-
-    std::wstringstream stream(text);
-    std::wstring line;
-
-    double accumulatedMilliseconds = 0.0;
-
-    while (std::getline(stream, line))
-    {
-        double deltaMilliseconds = 0.0;
-        std::wstring inputName;
-        bool down = true;
-
-        if (!ParseDeltaTimelineLine(
-                line,
-                deltaMilliseconds,
-                inputName,
-                down))
-        {
-            // Ignore blank lines and comments.
-            // Any non-empty invalid line makes the timeline invalid,
-            // because this visualizer intentionally accepts ONLY the
-            // delta timeline format.
-            if (!Trim(line).empty() && Trim(line)[0] != L'#')
-                return false;
-
-            continue;
-        }
-
-        accumulatedMilliseconds += deltaMilliseconds;
-
-        TimelineEvent event;
-        event.time = accumulatedMilliseconds / 1000.0;
-        event.name = inputName;
-        event.down = down;
-
-        parsed.push_back(event);
-    }
-
-    if (parsed.empty())
-        return false;
-
-    std::stable_sort(
-        parsed.begin(),
-        parsed.end(),
-        [](const TimelineEvent& a, const TimelineEvent& b)
-        {
-            return a.time < b.time;
-        });
-
-    events = std::move(parsed);
-
-    // Keep a short tail after the last event so the final press/release
-    // state can actually be seen.
-    duration = std::max(0.5, events.back().time + 0.5);
-
-    currentTime = 0.0;
-    ResetPlaybackState();
-
-    return true;
+static void renderFinal(HDC dc,int w,int h){
+ if(!loadImage()){
+  HBRUSH q=CreateSolidBrush(GREEN);RECT r{0,0,w,h};FillRect(dc,&r,q);DeleteObject(q);
+  text(dc,L"image.png NOT FOUND",0,0,w,h,30,true,RGB(0,0,0));return;
+ }
+ Graphics g(dc);g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+ g.DrawImage(img,Rect(0,0,w,h),0,0,(INT)iw,(INT)ih,UnitPixel);
+ drawPressed(dc,w,h);dynamicInfo(dc,w,h);
 }
-
-// ============================================================
-// HELD STATE
-// ============================================================
-
-static bool IsHeld(const std::wstring& name)
-{
-    std::wstring n = ToUpper(name);
-
-    return std::find(
-        heldKeys.begin(),
-        heldKeys.end(),
-        n) != heldKeys.end();
+static void renderPreview(HDC dc,int w,int h){
+ HBRUSH q=CreateSolidBrush(RGB(18,18,22));RECT r{0,0,w,h};FillRect(dc,&r,q);DeleteObject(q);
+ wchar_t b[64]{};swprintf_s(b,L"APM %d",apm(nowTime));text(dc,b,0,25,w,90,50,true,RGB(255,255,255));
+ wchar_t t[64]{};swprintf_s(t,L"%02d:%05.2f",(int)(nowTime/60),fmod(nowTime,60.0));
+ text(dc,t,0,90,w,130,22,false,RGB(255,255,255));
+ auto a=last10(nowTime);std::wstring line;
+ for(size_t i=0;i<a.size();i++){if(i)line+=L"  ";line+=a[i];}
+ text(dc,line,30,140,w-30,190,18,true,RGB(255,255,255));
+ int bx=40,by=h-35,bw=w-80,bh=12;HBRUSH d=CreateSolidBrush(RGB(55,55,60));
+ RECT br{bx,by,bx+bw,by+bh};FillRect(dc,&br,d);DeleteObject(d);
+ double p=lengthSec?nowTime/lengthSec:0;p=std::max(0.0,std::min(1.0,p));
+ HBRUSH f=CreateSolidBrush(PURPLE);RECT pr{bx,by,bx+(int)(bw*p),by+bh};FillRect(dc,&pr,f);DeleteObject(f);
 }
-
-static void SetHeld(const std::wstring& name, bool held)
-{
-    std::wstring n = ToUpper(name);
-
-    auto it = std::find(
-        heldKeys.begin(),
-        heldKeys.end(),
-        n);
-
-    if (held)
-    {
-        if (it == heldKeys.end())
-            heldKeys.push_back(n);
-    }
-    else
-    {
-        if (it != heldKeys.end())
-            heldKeys.erase(it);
-    }
+static HBITMAP dib(HDC ref,int w,int h,HDC*mem){
+ *mem=CreateCompatibleDC(ref);if(!*mem)return nullptr;
+ BITMAPINFO bi{};bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bi.bmiHeader.biWidth=w;
+ bi.bmiHeader.biHeight=-h;bi.bmiHeader.biPlanes=1;bi.bmiHeader.biBitCount=32;
+ bi.bmiHeader.biCompression=BI_RGB;void*bits=nullptr;
+ HBITMAP b=CreateDIBSection(*mem,&bi,DIB_RGB_COLORS,&bits,nullptr,0);
+ if(!b){DeleteDC(*mem);*mem=nullptr;}return b;
 }
-
-static void ResetPlaybackState()
-{
-    heldKeys.clear();
-    processedEventIndex = 0;
+static int gifEncoder(CLSID*c){
+ UINT n=0,s=0;GetImageEncodersSize(&n,&s);if(!s)return -1;
+ std::vector<BYTE>v(s);auto*p=(ImageCodecInfo*)v.data();GetImageEncoders(n,s,p);
+ for(UINT i=0;i<n;i++)if(wcscmp(p[i].MimeType,L"image/gif")==0){*c=p[i].Clsid;return(int)i;}
+ return -1;
 }
-
-static void ProcessEventsTo(double targetTime)
-{
-    while (
-        processedEventIndex < events.size() &&
-        events[processedEventIndex].time <= targetTime + 1e-9)
-    {
-        const TimelineEvent& event =
-            events[processedEventIndex];
-
-        SetHeld(event.name, event.down);
-
-        ++processedEventIndex;
-    }
+static void prop(Bitmap*b,PROPID id,WORD type,DWORD len,void*v){
+ PropertyItem p{};p.id=id;p.type=type;p.length=len;p.value=v;b->SetPropertyItem(&p);
 }
-
-// ============================================================
-// APM / LAST 10 PRESSES
-// ============================================================
-
-static int CalculateAPM(double time)
-{
-    double start = time - 60.0;
-    int count = 0;
-
-    for (const TimelineEvent& event : events)
-    {
-        if (!event.down)
-            continue;
-
-        if (event.time > time)
-            break;
-
-        if (event.time >= start)
-            ++count;
-    }
-
-    return count;
+static Bitmap* frame(double t){
+ HDC s=GetDC(nullptr);if(!s)return nullptr;HDC dc=nullptr;HBITMAP b=dib(s,GW,GH,&dc);ReleaseDC(nullptr,s);
+ if(!b)return nullptr;HBITMAP old=(HBITMAP)SelectObject(dc,b);
+ nowTime=t;resetState();processTo(t);renderFinal(dc,GW,GH);SelectObject(dc,old);
+ Bitmap*out=new Bitmap(b,nullptr);DeleteObject(b);DeleteDC(dc);
+ if(!out||out->GetLastStatus()!=Ok){delete out;return nullptr;}return out;
 }
-
-// IMPORTANT:
-// This is LAST 10 BUTTONS PRESSED.
-// Release events are completely ignored.
-// Example:
-// Q+ Q- W+ W-
-// gives:
-// Q W
-static std::vector<std::wstring> GetLastTenInputs(double time)
-{
-    std::vector<std::wstring> result;
-
-    for (auto it = events.rbegin(); it != events.rend(); ++it)
-    {
-        if (it->time > time)
-            continue;
-
-        if (!it->down)
-            continue;
-
-        result.push_back(it->name);
-
-        if (result.size() == 10)
-            break;
-    }
-
-    std::reverse(result.begin(), result.end());
-
-    return result;
+static bool exportGif(){
+ if(evs.empty()){MessageBoxW(gWnd,L"Load a timeline first.",L"Export GIF",MB_OK|MB_ICONWARNING);return false;}
+ if(!loadImage()){MessageBoxW(gWnd,L"image.png must be beside APMTimelineVisualizer.exe.",L"Export GIF",MB_OK|MB_ICONERROR);return false;}
+ CLSID c{};if(gifEncoder(&c)<0)return false;
+ std::wstring out=exeDir()+L"\\APM_Replay.gif";DeleteFileW(out.c_str());
+ ULONG delay=2;WORD loop=0;
+ EncoderParameters st{};st.Count=1;st.Parameter[0].Guid=EncoderSaveFlag;st.Parameter[0].Type=EncoderParameterValueTypeLong;
+ st.Parameter[0].NumberOfValues=1;ULONG mf=EncoderValueMultiFrame;st.Parameter[0].Value=&mf;
+ Bitmap*first=frame(0);if(!first)return false;
+ prop(first,PropertyTagFrameDelay,PropertyTagTypeLong,sizeof(ULONG),&delay);
+ prop(first,PropertyTagLoopCount,PropertyTagTypeShort,sizeof(WORD),&loop);
+ if(first->Save(out.c_str(),&c,&st)!=Ok){delete first;return false;}
+ EncoderParameters add{};add.Count=1;add.Parameter[0].Guid=EncoderSaveFlag;add.Parameter[0].Type=EncoderParameterValueTypeLong;
+ add.Parameter[0].NumberOfValues=1;ULONG ft=EncoderValueFrameDimensionTime;add.Parameter[0].Value=&ft;
+ long long n=std::max<long long>(1,(long long)std::ceil(lengthSec*FPS));
+ for(long long i=1;i<n;i++){Bitmap*x=frame((double)i/FPS);if(!x){first->SaveAdd(EncoderValueFlush);delete first;return false;}
+  prop(x,PropertyTagFrameDelay,PropertyTagTypeLong,sizeof(ULONG),&delay);
+  if(first->SaveAdd(x,&add)!=Ok){delete x;first->SaveAdd(EncoderValueFlush);delete first;return false;}delete x;
+ }
+ first->SaveAdd(EncoderValueFlush);delete first;
+ MessageBoxW(gWnd,(L"GIF exported:\n"+out).c_str(),L"Export GIF",MB_OK|MB_ICONINFORMATION);return true;
 }
-
-// ============================================================
-// SECOND TIMELINE
-// ============================================================
-
-static std::wstring BuildSecondTimelineText()
-{
-    if (events.empty())
-        return L"";
-
-    std::wstringstream output;
-
-    int totalSeconds =
-        std::max(1, static_cast<int>(std::ceil(duration)));
-
-    for (int second = 1; second <= totalSeconds; ++second)
-    {
-        double startTime = static_cast<double>(second - 1);
-        double endTime = static_cast<double>(second);
-
-        std::vector<std::wstring> active;
-
-        ResetPlaybackState();
-        ProcessEventsTo(startTime);
-
-        for (const auto& key : heldKeys)
-            active.push_back(key);
-
-        for (const TimelineEvent& event : events)
-        {
-            if (event.time < startTime)
-                continue;
-
-            if (event.time >= endTime)
-                break;
-
-            if (
-                event.down &&
-                std::find(
-                    active.begin(),
-                    active.end(),
-                    event.name) == active.end())
-            {
-                active.push_back(event.name);
-            }
-        }
-
-        output << second << L"s  ";
-
-        if (active.empty())
-        {
-            output << L"-";
-        }
-        else
-        {
-            for (size_t i = 0; i < active.size(); ++i)
-            {
-                if (i)
-                    output << L" + ";
-
-                output << active[i];
-            }
-        }
-
-        if (second < totalSeconds)
-            output << L"\r\n";
-    }
-
-    return output.str();
+static std::wstring editText(HWND h){
+ int n=GetWindowTextLengthW(h);if(n<=0)return L"";std::wstring s(n+1,L'\0');GetWindowTextW(h,&s[0],n+1);s.resize(n);return s;
 }
-
-static void UpdateSecondTimeline()
-{
-    if (!hwndSecondTimeline)
-        return;
-
-    std::wstring text = BuildSecondTimelineText();
-
-    SetWindowTextW(
-        hwndSecondTimeline,
-        text.c_str());
-
-    ResetPlaybackState();
-    ProcessEventsTo(currentTime);
+static std::wstring editText(HWND h);\n\nstatic void layout(HWND h){
+ RECT r{};GetClientRect(h,&r);int w=r.right,H=r.bottom;
+ MoveWindow(gEdit,10,10,w-20,H-170,TRUE);
+ MoveWindow(gLoad,10,H-150,100,30,TRUE);
+ MoveWindow(gPlay,120,H-150,90,30,TRUE);
+ MoveWindow(gReset,220,H-150,90,30,TRUE);
+ MoveWindow(gExport,320,H-150,110,30,TRUE);
 }
-
-// ============================================================
-// EDIT CONTROL
-// ============================================================
-
-static std::wstring GetEditText(HWND edit)
-{
-    int length = GetWindowTextLengthW(edit);
-
-    if (length <= 0)
-        return L"";
-
-    std::wstring text(
-        static_cast<size_t>(length) + 1,
-        L'\0');
-
-    GetWindowTextW(
-        edit,
-        &text[0],
-        length + 1);
-
-    text.resize(
-        static_cast<size_t>(length));
-
-    return text;
+static void tick(){
+ if(!playing)return;LARGE_INTEGER q{};QueryPerformanceCounter(&q);
+ nowTime=playOrigin+(double)(q.QuadPart-playStart.QuadPart)/pf.QuadPart;
+ if(nowTime>=lengthSec){nowTime=lengthSec;playing=false;SetWindowTextW(gPlay,L"Play");}
+ resetState();processTo(nowTime);InvalidateRect(gWnd,nullptr,FALSE);
 }
-
-// ============================================================
-// DRAW HELPERS
-// ============================================================
-
-static void FillRectColor(
-    HDC hdc,
-    int left,
-    int top,
-    int right,
-    int bottom,
-    COLORREF color)
-{
-    RECT r{
-        left,
-        top,
-        right,
-        bottom
-    };
-
-    HBRUSH brush =
-        CreateSolidBrush(color);
-
-    FillRect(
-        hdc,
-        &r,
-        brush);
-
-    DeleteObject(brush);
+static LRESULT CALLBACK wndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+ switch(m){
+ case WM_SIZE:layout(h);return 0;
+ case WM_TIMER:tick();return 0;
+ case WM_COMMAND:
+  if((HWND)l==gLoad){
+   if(!parseTimeline(editText(gEdit))){
+    MessageBoxW(h,L"Timeline error.\n\nUse only:\n<delta_ms> <key>+\n<delta_ms> <key>-",
+      L"Timeline error",MB_OK|MB_ICONERROR);
+   }else{
+    playing=false;nowTime=0;resetState();SetWindowTextW(gPlay,L"Play");InvalidateRect(h,nullptr,FALSE);
+   }
+  } else if((HWND)l==gPlay){if(playing){playing=false;SetWindowTextW(gPlay,L"Play");}
+   else if(!evs.empty()){playing=true;playOrigin=nowTime;QueryPerformanceCounter(&playStart);SetWindowTextW(gPlay,L"Pause");}}
+  else if((HWND)l==gReset){playing=false;nowTime=0;resetState();SetWindowTextW(gPlay,L"Play");InvalidateRect(h,nullptr,FALSE);}
+  else if((HWND)l==gExport)exportGif();
+  else if((HWND)l==gEdit && HIWORD(w)==EN_CHANGE)InvalidateRect(h,nullptr,FALSE);
+  return 0;
+ case WM_PAINT:{
+  PAINTSTRUCT p{};HDC dc=BeginPaint(h,&p);RECT r{};GetClientRect(h,&r);
+  int ph=std::max(100,r.bottom-175);renderPreview(dc,r.right,ph);EndPaint(h,&p);return 0;}
+ case WM_DESTROY:KillTimer(h,1);delete img;GdiplusShutdown(gdToken);PostQuitMessage(0);return 0;
+ }
+ return DefWindowProcW(h,m,w,l);
 }
-
-static void DrawCenteredText(
-    HDC hdc,
-    const std::wstring& text,
-    int left,
-    int top,
-    int right,
-    int bottom,
-    int fontSize,
-    bool bold,
-    COLORREF color)
-{
-    HFONT font = CreateFontW(
-        -fontSize,
-        0,
-        0,
-        0,
-        bold ? FW_BOLD : FW_NORMAL,
-        FALSE,
-        FALSE,
-        FALSE,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        ANTIALIASED_QUALITY,
-        DEFAULT_PITCH | FF_DONTCARE,
-        L"Arial");
-
-    HFONT old =
-        static_cast<HFONT>(
-            SelectObject(hdc, font));
-
-    SetBkMode(
-        hdc,
-        TRANSPARENT);
-
-    SetTextColor(
-        hdc,
-        color);
-
-    RECT r{
-        left,
-        top,
-        right,
-        bottom
-    };
-
-    DrawTextW(
-        hdc,
-        text.c_str(),
-        -1,
-        &r,
-        DT_CENTER |
-        DT_VCENTER |
-        DT_SINGLELINE);
-
-    SelectObject(
-        hdc,
-        old);
-
-    DeleteObject(font);
-}
-
-// ============================================================
-// USER PNG
-// ============================================================
-
-static bool LoadUserImage()
-{
-    if (userImage)
-        return true;
-
-    std::wstring path =
-        ArtworkPath();
-
-    userImage =
-        new Bitmap(
-            path.c_str(),
-            FALSE);
-
-    if (
-        !userImage ||
-        userImage->GetLastStatus() != Ok)
-    {
-        delete userImage;
-        userImage = nullptr;
-        return false;
-    }
-
-    userImageWidth =
-        userImage->GetWidth();
-
-    userImageHeight =
-        userImage->GetHeight();
-
-    return
-        userImageWidth > 0 &&
-        userImageHeight > 0;
-}
-
-static bool IsGreenPixel(
-    BYTE r,
-    BYTE g,
-    BYTE b)
-{
-    return
-        g > 100 &&
-        g > static_cast<BYTE>(r * 1.25) &&
-        g > static_cast<BYTE>(b * 1.25);
-}
-
-struct ImageRegion
-{
-    const wchar_t* name;
-    float left;
-    float top;
-    float right;
-    float bottom;
-};
-
-static const ImageRegion IMAGE_REGIONS[] =
-{
-    {L"1", 0.095f, 0.420f, 0.120f, 0.570f},
-    {L"2", 0.120f, 0.420f, 0.145f, 0.570f},
-    {L"3", 0.145f, 0.420f, 0.170f, 0.570f},
-    {L"4", 0.170f, 0.420f, 0.195f, 0.570f},
-    {L"5", 0.195f, 0.420f, 0.220f, 0.570f},
-
-    {L"Q", 0.105f, 0.555f, 0.140f, 0.690f},
-    {L"W", 0.135f, 0.555f, 0.170f, 0.690f},
-    {L"E", 0.165f, 0.555f, 0.200f, 0.690f},
-    {L"R", 0.195f, 0.555f, 0.230f, 0.690f},
-    {L"T", 0.225f, 0.555f, 0.260f, 0.690f}
-};
-
-static const ImageRegion* FindImageRegion(
-    const std::wstring& name)
-{
-    std::wstring n =
-        ToUpper(name);
-
-    for (const auto& region : IMAGE_REGIONS)
-    {
-        if (n == region.name)
-            return &region;
-    }
-
-    return nullptr;
-}
-
-// ============================================================
-// SCENE BITMAP RENDERING
-// ============================================================
-
-static void DrawArtwork(
-    HDC hdc,
-    int width,
-    int height)
-{
-    if (!LoadUserImage())
-    {
-        FillRectColor(
-            hdc,
-            0,
-            0,
-            width,
-            height,
-            RGB(0, 255, 0));
-
-        DrawCenteredText(
-            hdc,
-            L"image.png NOT FOUND",
-            0,
-            0,
-            width,
-            height,
-            34,
-            true,
-            RGB(0, 0, 0));
-
-        return;
-    }
-
-    Graphics graphics(hdc);
-
-    graphics.SetInterpolationMode(
-        InterpolationModeHighQualityBicubic);
-
-    graphics.SetPixelOffsetMode(
-        PixelOffsetModeHighQuality);
-
-    graphics.DrawImage(
-        userImage,
-        Rect(
-            0,
-            0,
-            width,
-            height),
-        0,
-        0,
-        static_cast<INT>(userImageWidth),
-        static_cast<INT>(userImageHeight),
-        UnitPixel);
-}
-
-static void InvertPressedRegions(
-    HDC hdc,
-    int width,
-    int height)
-{
-    for (const auto& region : IMAGE_REGIONS)
-    {
-        if (!IsHeld(region.name))
-            continue;
-
-        int left =
-            static_cast<int>(
-                region.left * width);
-
-        int top =
-            static_cast<int>(
-                region.top * height);
-
-        int right =
-            static_cast<int>(
-                region.right * width);
-
-        int bottom =
-            static_cast<int>(
-                region.bottom * height);
-
-        for (int y = top; y < bottom; ++y)
-        {
-            for (int x = left; x < right; ++x)
-            {
-                COLORREF c =
-                    GetPixel(
-                        hdc,
-                        x,
-                        y);
-
-                if (c == CLR_INVALID)
-                    continue;
-
-                BYTE r = GetRValue(c);
-                BYTE g = GetGValue(c);
-                BYTE b = GetBValue(c);
-
-                // Leave green chroma-key background untouched.
-                if (IsGreenPixel(r, g, b))
-                    continue;
-
-                SetPixelV(
-                    hdc,
-                    x,
-                    y,
-                    RGB(
-                        255 - r,
-                        255 - g,
-                        255 - b));
-            }
-        }
-    }
-}
-
-static void DrawDynamicInfo(
-    HDC hdc,
-    int width,
-    int height)
-{
-    int apm =
-        CalculateAPM(currentTime);
-
-    wchar_t apmText[32]{};
-
-    swprintf_s(
-        apmText,
-        L"%d",
-        apm);
-
-    DrawCenteredText(
-        hdc,
-        apmText,
-        static_cast<int>(width * 0.485),
-        static_cast<int>(height * 0.405),
-        static_cast<int>(width * 0.560),
-        static_cast<int>(height * 0.545),
-        24,
-        true,
-        RGB(0, 0, 0));
-
-    // Only press events appear here.
-    std::vector<std::wstring> last =
-        GetLastTenInputs(currentTime);
-
-    int x1 =
-        static_cast<int>(
-            width * 0.495);
-
-    int x2 =
-        static_cast<int>(
-            width * 0.675);
-
-    int y =
-        static_cast<int>(
-            height * 0.565);
-
-    int rowH = 20;
-
-    for (size_t i = 0; i < last.size(); ++i)
-    {
-        DrawCenteredText(
-            hdc,
-            last[i],
-            x1,
-            y + static_cast<int>(i) * rowH,
-            x2,
-            y + static_cast<int>(i + 1) * rowH,
-            13,
-            true,
-            RGB(0, 0, 0));
-    }
-}
-
-static void RenderFinalArtwork(
-    HDC hdc,
-    int width,
-    int height)
-{
-    DrawArtwork(
-        hdc,
-        width,
-        height);
-
-    InvertPressedRegions(
-        hdc,
-        width,
-        height);
-
-    DrawDynamicInfo(
-        hdc,
-        width,
-        height);
-}
-
-static void RenderPreview(
-    HDC hdc,
-    int width,
-    int height)
-{
-    FillRectColor(
-        hdc,
-        0,
-        0,
-        width,
-        height,
-        RGB(18, 18, 22));
-
-    int apm =
-        CalculateAPM(currentTime);
-
-    wchar_t apmText[64]{};
-
-    swprintf_s(
-        apmText,
-        L"APM %d",
-        apm);
-
-    DrawCenteredText(
-        hdc,
-        apmText,
-        0,
-        40,
-        width,
-        130,
-        58,
-        true,
-        RGB(255, 255, 255));
-
-    wchar_t timeText[64]{};
-
-    swprintf_s(
-        timeText,
-        L"%02d:%05.2f",
-        static_cast<int>(
-            currentTime / 60.0),
-        fmod(
-            currentTime,
-            60.0));
-
-    DrawCenteredText(
-        hdc,
-        timeText,
-        0,
-        135,
-        width,
-        180,
-        24,
-        false,
-        RGB(255, 255, 255));
-
-    // Normal preview intentionally does NOT draw the PNG artwork.
-    const int barX = 60;
-    const int barY = height - 40;
-    const int barW =
-        std::max(100, width - 120);
-    const int barH = 16;
-
-    FillRectColor(
-        hdc,
-        barX,
-        barY,
-        barX + barW,
-        barY + barH,
-        RGB(50, 50, 55));
-
-    double progress =
-        duration > 0.0
-            ? currentTime / duration
-            : 0.0;
-
-    progress =
-        std::max(
-            0.0,
-            std::min(
-                1.0,
-                progress));
-
-    FillRectColor(
-        hdc,
-        barX,
-        barY,
-        barX +
-            static_cast<int>(
-                barW * progress),
-        barY + barH,
-        RGB(255, 170, 40));
-}
-
-// ============================================================
-// BITMAP SURFACE
-// ============================================================
-
-static HBITMAP Create32BitBitmap(
-    HDC referenceDC,
-    int width,
-    int height,
-    void** bits,
-    HDC* memoryDC)
-{
-    *bits = nullptr;
-
-    *memoryDC =
-        CreateCompatibleDC(
-            referenceDC);
-
-    if (!*memoryDC)
-        return nullptr;
-
-    BITMAPINFO bmi{};
-
-    bmi.bmiHeader.biSize =
-        sizeof(BITMAPINFOHEADER);
-
-    bmi.bmiHeader.biWidth =
-        width;
-
-    bmi.bmiHeader.biHeight =
-        -height;
-
-    bmi.bmiHeader.biPlanes =
-        1;
-
-    bmi.bmiHeader.biBitCount =
-        32;
-
-    bmi.bmiHeader.biCompression =
-        BI_RGB;
-
-    HBITMAP bitmap =
-        CreateDIBSection(
-            *memoryDC,
-            &bmi,
-            DIB_RGB_COLORS,
-            bits,
-            nullptr,
-            0);
-
-    if (!bitmap)
-    {
-        DeleteDC(*memoryDC);
-        *memoryDC = nullptr;
-    }
-
-    return bitmap;
-}
-
-// ============================================================
-// GIF ENCODER HELPERS
-// ============================================================
-
-static int GetEncoderClsid(
-    const WCHAR* mimeType,
-    CLSID* clsid)
-{
-    UINT num = 0;
-    UINT size = 0;
-
-    GetImageEncodersSize(
-        &num,
-        &size);
-
-    if (size == 0)
-        return -1;
-
-    std::vector<BYTE> buffer(size);
-
-    ImageCodecInfo* codecs =
-        reinterpret_cast<ImageCodecInfo*>(
-            buffer.data());
-
-    GetImageEncoders(
-        num,
-        size,
-        codecs);
-
-    for (UINT i = 0; i < num; ++i)
-    {
-        if (
-            wcscmp(
-                codecs[i].MimeType,
-                mimeType) == 0)
-        {
-            *clsid =
-                codecs[i].Clsid;
-
-            return static_cast<int>(i);
-        }
-    }
-
-    return -1;
-}
-
-static void SetGifProperty(
-    Bitmap* bitmap,
-    PROPID id,
-    WORD type,
-    DWORD length,
-    void* value)
-{
-    PropertyItem item{};
-
-    item.id = id;
-    item.length = length;
-    item.type = type;
-    item.value = value;
-
-    bitmap->SetPropertyItem(&item);
-}
-
-static Bitmap* RenderGifFrame(
-    double time)
-{
-    HDC screen =
-        GetDC(nullptr);
-
-    if (!screen)
-        return nullptr;
-
-    void* bits = nullptr;
-    HDC dc = nullptr;
-
-    HBITMAP dib =
-        Create32BitBitmap(
-            screen,
-            GIF_WIDTH,
-            GIF_HEIGHT,
-            &bits,
-            &dc);
-
-    ReleaseDC(
-        nullptr,
-        screen);
-
-    if (!dib)
-        return nullptr;
-
-    HBITMAP old =
-        static_cast<HBITMAP>(
-            SelectObject(
-                dc,
-                dib));
-
-    currentTime = time;
-
-    ResetPlaybackState();
-    ProcessEventsTo(currentTime);
-
-    RenderFinalArtwork(
-        dc,
-        GIF_WIDTH,
-        GIF_HEIGHT);
-
-    SelectObject(
-        dc,
-        old);
-
-    Bitmap* result =
-        new Bitmap(
-            dib,
-            nullptr);
-
-    DeleteObject(dib);
-    DeleteDC(dc);
-
-    if (
-        !result ||
-        result->GetLastStatus() != Ok)
-    {
-        delete result;
-        return nullptr;
-    }
-
-    return result;
-}
-
-// ============================================================
-// EXPORT GIF
-// ============================================================
-
-static bool ExportGIF()
-{
-    if (events.empty())
-    {
-        MessageBoxW(
-            hwndMain,
-            L"Load a timeline first.",
-            L"Export GIF",
-            MB_OK | MB_ICONWARNING);
-
-        return false;
-    }
-
-    if (!LoadUserImage())
-    {
-        std::wstring msg =
-            L"image.png was not found beside the EXE.\n\nExpected:\n" +
-            ArtworkPath();
-
-        MessageBoxW(
-            hwndMain,
-            msg.c_str(),
-            L"Export GIF",
-            MB_OK | MB_ICONERROR);
-
-        return false;
-    }
-
-    CLSID gifClsid{};
-
-    if (
-        GetEncoderClsid(
-            L"image/gif",
-            &gifClsid) < 0)
-    {
-        MessageBoxW(
-            hwndMain,
-            L"Windows GIF encoder was not found.",
-            L"Export GIF",
-            MB_OK | MB_ICONERROR);
-
-        return false;
-    }
-
-    const std::wstring outputPath =
-        GetExeDirectory() +
-        L"\\APM_Replay.gif";
-
-    DeleteFileW(
-        outputPath.c_str());
-
-    const long long totalFrames =
-        std::max<long long>(
-            1,
-            static_cast<long long>(
-                std::ceil(
-                    duration *
-                    static_cast<double>(FPS))));
-
-    // GIF delay is in 1/100 second units.
-    // 2 = approximately 50 FPS. This is the closest practical
-    // GIF timing to the requested 60 FPS.
-    const ULONG frameDelay = 2;
-
-    const WORD loopCount = 0;
-
-    EncoderParameters startParams{};
-
-    startParams.Count = 1;
-
-    startParams.Parameter[0].Guid =
-        EncoderSaveFlag;
-
-    startParams.Parameter[0].Type =
-        EncoderParameterValueTypeLong;
-
-    startParams.Parameter[0].NumberOfValues =
-        1;
-
-    ULONG multiFrame =
-        EncoderValueMultiFrame;
-
-    startParams.Parameter[0].Value =
-        &multiFrame;
-
-    Bitmap* firstFrame =
-        RenderGifFrame(0.0);
-
-    if (!firstFrame)
-    {
-        MessageBoxW(
-            hwndMain,
-            L"Could not render the first GIF frame.",
-            L"Export GIF",
-            MB_OK | MB_ICONERROR);
-
-        return false;
-    }
-
-    SetGifProperty(
-        firstFrame,
-        PropertyTagFrameDelay,
-        PropertyTagTypeLong,
-        sizeof(ULONG),
-        const_cast<ULONG*>(&frameDelay));
-
-    SetGifProperty(
-        firstFrame,
-        PropertyTagLoopCount,
-        PropertyTagTypeShort,
-        sizeof(WORD),
-        const_cast<WORD*>(&loopCount));
-
-    Status status =
-        firstFrame->Save(
-            outputPath.c_str(),
-            &gifClsid,
-            &startParams);
-
-    if (status != Ok)
-    {
-        delete firstFrame;
-
-        DeleteFileW(
-            outputPath.c_str());
-
-        MessageBoxW(
-            hwndMain,
-            L"Could not start GIF encoding.",
-            L"Export GIF",
-            MB_OK | MB_ICONERROR);
-
-        return false;
-    }
-
-    EncoderParameters addParams{};
-
-    addParams.Count = 1;
-
-    addParams.Parameter[0].Guid =
-        EncoderSaveFlag;
-
-    addParams.Parameter[0].Type =
-        EncoderParameterValueTypeLong;
-
-    addParams.Parameter[0].NumberOfValues =
-        1;
-
-    ULONG nextFrame =
-        EncoderValueFrameDimensionTime;
-
-    addParams.Parameter[0].Value =
-        &nextFrame;
-
-    bool success = true;
-
-    for (
-        long long frame = 1;
-        frame < totalFrames;
-        ++frame)
-    {
-        const double t =
-            std::min(
-                duration,
-                static_cast<double>(frame) /
-                static_cast<double>(FPS));
-
-        Bitmap* image =
-            RenderGifFrame(t);
-
-        if (!image)
-        {
-            success = false;
-            break;
-        }
-
-        SetGifProperty(
-            image,
-            PropertyTagFrameDelay,
-            PropertyTagTypeLong,
-            sizeof(ULONG),
-            const_cast<ULONG*>(&frameDelay));
-
-        status =
-            firstFrame->SaveAdd(
-                image,
-                &addParams);
-
-        delete image;
-
-        if (status != Ok)
-        {
-            success = false;
-            break;
-        }
-    }
-
-    if (success)
-    {
-        EncoderParameters flushParams{};
-
-        flushParams.Count = 1;
-
-        flushParams.Parameter[0].Guid =
-            EncoderSaveFlag;
-
-        flushParams.Parameter[0].Type =
-            EncoderParameterValueTypeLong;
-
-        flushParams.Parameter[0].NumberOfValues =
-            1;
-
-        ULONG flush =
-            EncoderValueFlush;
-
-        flushParams.Parameter[0].Value =
-            &flush;
-
-        status =
-            firstFrame->SaveAdd(
-                &flushParams);
-
-        if (status != Ok)
-            success = false;
-    }
-
-    delete firstFrame;
-
-    currentTime = 0.0;
-
-    ResetPlaybackState();
-
-    InvalidateRect(
-        hwndMain,
-        nullptr,
-        TRUE);
-
-    if (success)
-    {
-        wchar_t message[512]{};
-
-        swprintf_s(
-            message,
-            L"GIF exported successfully.\n\n%ls\n\nSize: %dx%d\nFrames: %lld\nFPS: %d",
-            outputPath.c_str(),
-            GIF_WIDTH,
-            GIF_HEIGHT,
-            totalFrames,
-            FPS);
-
-        MessageBoxW(
-            hwndMain,
-            message,
-            L"Export Complete",
-            MB_OK | MB_ICONINFORMATION);
-    }
-    else
-    {
-        DeleteFileW(
-            outputPath.c_str());
-
-        MessageBoxW(
-            hwndMain,
-            L"GIF export failed.",
-            L"Export GIF",
-            MB_OK | MB_ICONERROR);
-    }
-
-    return success;
-}
-
-// ============================================================
-// LOAD TIMELINE
-// ============================================================
-
-static void LoadTimelineFromEditor()
-{
-    std::wstring text =
-        GetEditText(hwndTimeline);
-
-    if (!ParseTimeline(text))
-    {
-        MessageBoxW(
-            hwndMain,
-            L"No valid delta timeline events were found.\n\n"
-            L"Use ONLY this format:\n\n"
-            L"3234 S+\n"
-            L"94 S-\n"
-            L"203 T+\n"
-            L"109 T-\n"
-            L"0 A+\n"
-            L"157 R+\n"
-            L"31 A-\n"
-            L"78 R-\n\n"
-            L"Number = milliseconds since the previous event.\n"
-            L"+ = press    - = release",
-            L"Timeline Error",
-            MB_OK | MB_ICONWARNING);
-
-        return;
-    }
-
-    playing = false;
-
-    UpdateSecondTimeline();
-
-    SetWindowTextW(
-        hwndPlay,
-        L"Play");
-
-    InvalidateRect(
-        hwndMain,
-        nullptr,
-        TRUE);
-}
-
-// ============================================================
-// WINDOW PROCEDURE
-// ============================================================
-
-static LRESULT CALLBACK WindowProc(
-    HWND hwnd,
-    UINT msg,
-    WPARAM wParam,
-    LPARAM lParam)
-{
-    switch (msg)
-    {
-        case WM_CREATE:
-        {
-            CreateWindowW(
-                L"STATIC",
-                L"Raw Timeline - delta ms",
-                WS_CHILD | WS_VISIBLE,
-                20,
-                2,
-                520,
-                18,
-                hwnd,
-                nullptr,
-                nullptr,
-                nullptr);
-
-            CreateWindowW(
-                L"STATIC",
-                L"Per-Second Timeline",
-                WS_CHILD | WS_VISIBLE,
-                560,
-                2,
-                520,
-                18,
-                hwnd,
-                nullptr,
-                nullptr,
-                nullptr);
-
-            hwndTimeline =
-                CreateWindowExW(
-                    WS_EX_CLIENTEDGE,
-                    L"EDIT",
-                    L"",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    ES_MULTILINE |
-                    ES_AUTOVSCROLL |
-                    ES_WANTRETURN |
-                    WS_VSCROLL |
-                    WS_HSCROLL,
-                    20,
-                    20,
-                    520,
-                    220,
-                    hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
-
-            SendMessageW(
-                hwndTimeline,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(
-                    GetStockObject(
-                        DEFAULT_GUI_FONT)),
-                TRUE);
-
-            hwndSecondTimeline =
-                CreateWindowExW(
-                    WS_EX_CLIENTEDGE,
-                    L"EDIT",
-                    L"Load a timeline to generate the per-second view.",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    ES_MULTILINE |
-                    ES_AUTOVSCROLL |
-                    ES_READONLY |
-                    WS_VSCROLL |
-                    WS_HSCROLL,
-                    560,
-                    20,
-                    520,
-                    220,
-                    hwnd,
-                    nullptr,
-                    nullptr,
-                    nullptr);
-
-            SendMessageW(
-                hwndSecondTimeline,
-                WM_SETFONT,
-                reinterpret_cast<WPARAM>(
-                    GetStockObject(
-                        DEFAULT_GUI_FONT)),
-                TRUE);
-
-            hwndLoad =
-                CreateWindowW(
-                    L"BUTTON",
-                    L"Load Timeline",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    BS_PUSHBUTTON,
-                    20,
-                    255,
-                    150,
-                    40,
-                    hwnd,
-                    reinterpret_cast<HMENU>(1001),
-                    nullptr,
-                    nullptr);
-
-            hwndPlay =
-                CreateWindowW(
-                    L"BUTTON",
-                    L"Play",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    BS_PUSHBUTTON,
-                    180,
-                    255,
-                    100,
-                    40,
-                    hwnd,
-                    reinterpret_cast<HMENU>(1002),
-                    nullptr,
-                    nullptr);
-
-            hwndReset =
-                CreateWindowW(
-                    L"BUTTON",
-                    L"Reset",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    BS_PUSHBUTTON,
-                    290,
-                    255,
-                    100,
-                    40,
-                    hwnd,
-                    reinterpret_cast<HMENU>(1003),
-                    nullptr,
-                    nullptr);
-
-            hwndExportGIF =
-                CreateWindowW(
-                    L"BUTTON",
-                    L"Export GIF",
-                    WS_CHILD |
-                    WS_VISIBLE |
-                    BS_PUSHBUTTON,
-                    400,
-                    255,
-                    130,
-                    40,
-                    hwnd,
-                    reinterpret_cast<HMENU>(1004),
-                    nullptr,
-                    nullptr);
-
-            QueryPerformanceFrequency(
-                &performanceFrequency);
-
-            QueryPerformanceCounter(
-                &playbackStartPerformance);
-
-            playbackStartTimelineTime = 0.0;
-
-            SetTimer(
-                hwnd,
-                TIMER_PREVIEW,
-                16,
-                nullptr);
-
-            return 0;
-        }
-
-        case WM_COMMAND:
-        {
-            switch (LOWORD(wParam))
-            {
-                case 1001:
-                    LoadTimelineFromEditor();
-                    return 0;
-
-                case 1002:
-                    if (events.empty())
-                        return 0;
-
-                    if (playing)
-                    {
-                        playing = false;
-                    }
-                    else
-                    {
-                        if (currentTime >= duration)
-                        {
-                            currentTime = 0.0;
-                            ResetPlaybackState();
-                        }
-
-                        QueryPerformanceCounter(
-                            &playbackStartPerformance);
-
-                        playbackStartTimelineTime =
-                            currentTime;
-
-                        playing = true;
-                    }
-
-                    SetWindowTextW(
-                        hwndPlay,
-                        playing
-                            ? L"Pause"
-                            : L"Play");
-
-                    return 0;
-
-                case 1003:
-                    playing = false;
-
-                    currentTime = 0.0;
-
-                    playbackStartTimelineTime =
-                        0.0;
-
-                    QueryPerformanceCounter(
-                        &playbackStartPerformance);
-
-                    ResetPlaybackState();
-
-                    SetWindowTextW(
-                        hwndPlay,
-                        L"Play");
-
-                    InvalidateRect(
-                        hwnd,
-                        nullptr,
-                        TRUE);
-
-                    return 0;
-
-                case 1004:
-                    ExportGIF();
-                    return 0;
-            }
-
-            break;
-        }
-
-        case WM_TIMER:
-        {
-            if (
-                wParam == TIMER_PREVIEW &&
-                playing)
-            {
-                LARGE_INTEGER now{};
-
-                QueryPerformanceCounter(
-                    &now);
-
-                double elapsed =
-                    static_cast<double>(
-                        now.QuadPart -
-                        playbackStartPerformance.QuadPart) /
-                    static_cast<double>(
-                        performanceFrequency.QuadPart);
-
-                if (elapsed < 0.0)
-                    elapsed = 0.0;
-
-                currentTime =
-                    playbackStartTimelineTime +
-                    elapsed;
-
-                if (currentTime >= duration)
-                {
-                    currentTime = duration;
-                    playing = false;
-
-                    SetWindowTextW(
-                        hwndPlay,
-                        L"Play");
-
-                    playbackStartTimelineTime =
-                        duration;
-
-                    ResetPlaybackState();
-                }
-
-                InvalidateRect(
-                    hwnd,
-                    nullptr,
-                    TRUE);
-            }
-
-            return 0;
-        }
-
-        case WM_PAINT:
-        {
-            PAINTSTRUCT ps{};
-
-            HDC hdc =
-                BeginPaint(
-                    hwnd,
-                    &ps);
-
-            RECT client{};
-
-            GetClientRect(
-                hwnd,
-                &client);
-
-            const int sceneTop = 315;
-
-            FillRectColor(
-                hdc,
-                0,
-                sceneTop,
-                client.right,
-                client.bottom,
-                RGB(18, 18, 22));
-
-            int previewWidth =
-                client.right;
-
-            int previewHeight =
-                client.bottom -
-                sceneTop;
-
-            if (
-                previewWidth > 0 &&
-                previewHeight > 0)
-            {
-                HDC memDC =
-                    CreateCompatibleDC(hdc);
-
-                void* bits = nullptr;
-
-                HBITMAP bitmap =
-                    Create32BitBitmap(
-                        hdc,
-                        previewWidth,
-                        previewHeight,
-                        &bits,
-                        &memDC);
-
-                if (bitmap)
-                {
-                    HBITMAP oldBitmap =
-                        static_cast<HBITMAP>(
-                            SelectObject(
-                                memDC,
-                                bitmap));
-
-                    ResetPlaybackState();
-
-                    ProcessEventsTo(
-                        currentTime);
-
-                    RenderPreview(
-                        memDC,
-                        previewWidth,
-                        previewHeight);
-
-                    BitBlt(
-                        hdc,
-                        0,
-                        sceneTop,
-                        previewWidth,
-                        previewHeight,
-                        memDC,
-                        0,
-                        0,
-                        SRCCOPY);
-
-                    SelectObject(
-                        memDC,
-                        oldBitmap);
-
-                    DeleteObject(bitmap);
-                }
-
-                DeleteDC(memDC);
-            }
-
-            EndPaint(
-                hwnd,
-                &ps);
-
-            return 0;
-        }
-
-        case WM_SIZE:
-        {
-            int width =
-                LOWORD(lParam);
-
-            int paneWidth =
-                std::max(
-                    100,
-                    (width - 60) / 2);
-
-            if (hwndTimeline)
-            {
-                MoveWindow(
-                    hwndTimeline,
-                    20,
-                    20,
-                    paneWidth,
-                    220,
-                    TRUE);
-            }
-
-            if (hwndSecondTimeline)
-            {
-                MoveWindow(
-                    hwndSecondTimeline,
-                    40 + paneWidth,
-                    20,
-                    paneWidth,
-                    220,
-                    TRUE);
-            }
-
-            return 0;
-        }
-
-        case WM_DESTROY:
-        {
-            KillTimer(
-                hwnd,
-                TIMER_PREVIEW);
-
-            PostQuitMessage(0);
-
-            return 0;
-        }
-    }
-
-    return DefWindowProcW(
-        hwnd,
-        msg,
-        wParam,
-        lParam);
-}
-
-// ============================================================
-// ENTRY POINT
-// ============================================================
-
-int WINAPI wWinMain(
-    HINSTANCE hInstance,
-    HINSTANCE,
-    PWSTR,
-    int nCmdShow)
-{
-    GdiplusStartupInput
-        gdiplusStartupInput{};
-
-    if (
-        GdiplusStartup(
-            &gdiplusToken,
-            &gdiplusStartupInput,
-            nullptr) != Ok)
-    {
-        return 1;
-    }
-
-    WNDCLASSW wc{};
-
-    wc.lpfnWndProc =
-        WindowProc;
-
-    wc.hInstance =
-        hInstance;
-
-    wc.lpszClassName =
-        L"APMTimelineVisualizer";
-
-    wc.hCursor =
-        LoadCursorW(
-            nullptr,
-            IDC_ARROW);
-
-    wc.hbrBackground =
-        static_cast<HBRUSH>(
-            GetStockObject(
-                WHITE_BRUSH));
-
-    if (!RegisterClassW(&wc))
-    {
-        GdiplusShutdown(
-            gdiplusToken);
-
-        return 1;
-    }
-
-    hwndMain =
-        CreateWindowExW(
-            0,
-            wc.lpszClassName,
-            L"APM Timeline Visualizer",
-            WS_OVERLAPPEDWINDOW,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
-            nullptr,
-            nullptr,
-            hInstance,
-            nullptr);
-
-    if (!hwndMain)
-    {
-        GdiplusShutdown(
-            gdiplusToken);
-
-        return 1;
-    }
-
-    ShowWindow(
-        hwndMain,
-        nCmdShow);
-
-    UpdateWindow(
-        hwndMain);
-
-    MSG msg{};
-
-    while (
-        GetMessageW(
-            &msg,
-            nullptr,
-            0,
-            0) > 0)
-    {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    delete userImage;
-    userImage = nullptr;
-
-    GdiplusShutdown(
-        gdiplusToken);
-
-    return static_cast<int>(
-        msg.wParam);
+int APIENTRY wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
+ GdiplusStartupInput in{};if(GdiplusStartup(&gdToken,&in,nullptr)!=Ok)return 1;
+ QueryPerformanceFrequency(&pf);
+ WNDCLASSW wc{};wc.lpfnWndProc=wndProc;wc.hInstance=hi;wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
+ wc.hbrBackground=(HBRUSH)(COLOR_WINDOW+1);wc.lpszClassName=L"APMTimelineVisualizer";
+ RegisterClassW(&wc);
+ gWnd=CreateWindowExW(0,wc.lpszClassName,L"APM Timeline Visualizer",WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+  CW_USEDEFAULT,CW_USEDEFAULT,1000,760,nullptr,nullptr,hi,nullptr);
+ if(!gWnd){GdiplusShutdown(gdToken);return 1;}
+ gEdit=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_WANTRETURN,
+  0,0,0,0,gWnd,nullptr,hi,nullptr);
+ gLoad=CreateWindowW(L"BUTTON",L"Load Timeline",WS_CHILD|WS_VISIBLE,0,0,0,0,gWnd,nullptr,hi,nullptr);
+ gPlay=CreateWindowW(L"BUTTON",L"Play",WS_CHILD|WS_VISIBLE,0,0,0,0,gWnd,nullptr,hi,nullptr);
+ gReset=CreateWindowW(L"BUTTON",L"Reset",WS_CHILD|WS_VISIBLE,0,0,0,0,gWnd,nullptr,hi,nullptr);
+ gExport=CreateWindowW(L"BUTTON",L"Export GIF",WS_CHILD|WS_VISIBLE,0,0,0,0,gWnd,nullptr,hi,nullptr);
+ SetWindowTextW(gEdit,L"3234 S+\r\n94 S-\r\n203 T+\r\n109 T-\r\n0 A+\r\n157 R+\r\n31 A-\r\n78 R-\r\n94 T+\r\n125 T-");
+ SetTimer(gWnd,1,16,nullptr);layout(gWnd);
+ MSG m{};while(GetMessageW(&m,nullptr,0,0)>0){TranslateMessage(&m);DispatchMessageW(&m);}return(int)m.wParam;
 }
