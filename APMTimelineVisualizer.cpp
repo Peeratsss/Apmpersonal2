@@ -214,56 +214,110 @@ static bool ParseTimeline(
     std::wstringstream stream(text);
     std::wstring line;
 
+    // Compact format written by APMOverlay:
+    //   2218 S+
+    //   125 S-
+    //   0 T+
+    //   110 A+
+    //
+    // Number = delta milliseconds from the previous event.
+    // First number = milliseconds from recording start.
+    // NAME+ = press, NAME- = release.
+    //
+    // Legacy timestamp lines are also accepted.
+    double compactTimeMs = 0.0;
+    bool sawCompact = false;
     double previousClock = -1.0;
     double dayOffset = 0.0;
+    bool sawLegacy = false;
 
     while (std::getline(stream, line))
     {
         line = Trim(line);
 
-        if (line.empty())
+        if (line.empty() || line[0] == L'#' || line[0] == L'=')
             continue;
 
-        if (line[0] == L'#')
-            continue;
+        // --------------------------------------------------------
+        // COMPACT FORMAT
+        // --------------------------------------------------------
+        // Parse this BEFORE the legacy timestamp parser. Numeric
+        // input names such as 1, 2, 3 are valid names.
+        {
+            std::wstringstream compact(line);
+            long long deltaMs = 0;
+            std::wstring nameWithState;
+            std::wstring extra;
 
+            if (
+                (compact >> deltaMs) &&
+                (compact >> nameWithState) &&
+                !(compact >> extra) &&
+                deltaMs >= 0 &&
+                nameWithState.size() >= 2
+            )
+            {
+                wchar_t state =
+                    nameWithState[nameWithState.size() - 1];
+
+                bool isDown = state == L'+';
+                bool isUp = state == L'-';
+
+                if (isDown || isUp)
+                {
+                    std::wstring name =
+                        nameWithState.substr(
+                            0,
+                            nameWithState.size() - 1
+                        );
+
+                    if (!name.empty())
+                    {
+                        TimelineEvent event;
+
+                        compactTimeMs +=
+                            static_cast<double>(deltaMs);
+
+                        event.time =
+                            compactTimeMs / 1000.0;
+
+                        event.name = name;
+                        event.down = isDown;
+
+                        parsed.push_back(event);
+                        sawCompact = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------
+        // LEGACY TIMESTAMP FORMAT
+        // --------------------------------------------------------
         std::wstring timestampText;
         std::wstring inputName;
 
-        size_t tab =
-            line.find(L'\t');
+        size_t tab = line.find(L'\t');
 
         if (tab != std::wstring::npos)
         {
-            timestampText =
-                Trim(line.substr(0, tab));
-
-            inputName =
-                Trim(line.substr(tab + 1));
+            timestampText = Trim(line.substr(0, tab));
+            inputName = Trim(line.substr(tab + 1));
         }
         else
         {
-            std::wstring upper =
-                ToUpper(line);
-
-            size_t amPos =
-                upper.find(L" AM");
-
-            size_t pmPos =
-                upper.find(L" PM");
-
-            size_t pos =
-                std::wstring::npos;
+            std::wstring upper = ToUpper(line);
+            size_t amPos = upper.find(L" AM");
+            size_t pmPos = upper.find(L" PM");
+            size_t pos = std::wstring::npos;
 
             if (amPos != std::wstring::npos)
                 pos = amPos;
 
             if (
                 pmPos != std::wstring::npos &&
-                (
-                    pos == std::wstring::npos ||
-                    pmPos < pos
-                )
+                (pos == std::wstring::npos || pmPos < pos)
             )
             {
                 pos = pmPos;
@@ -272,44 +326,22 @@ static bool ParseTimeline(
             if (pos == std::wstring::npos)
                 continue;
 
-            size_t timestampEnd =
-                pos + 3;
+            size_t timestampEnd = pos + 3;
 
             timestampText =
-                Trim(
-                    line.substr(
-                        0,
-                        timestampEnd
-                    )
-                );
+                Trim(line.substr(0, timestampEnd));
 
             inputName =
-                Trim(
-                    line.substr(
-                        timestampEnd
-                    )
-                );
+                Trim(line.substr(timestampEnd));
         }
 
-        if (
-            timestampText.empty() ||
-            inputName.empty()
-        )
-        {
+        if (timestampText.empty() || inputName.empty())
             continue;
-        }
 
         double clockSeconds = 0.0;
 
-        if (
-            !ParseTimestamp(
-                timestampText,
-                clockSeconds
-            )
-        )
-        {
+        if (!ParseTimestamp(timestampText, clockSeconds))
             continue;
-        }
 
         if (
             previousClock >= 0.0 &&
@@ -322,28 +354,14 @@ static bool ParseTimeline(
         previousClock = clockSeconds;
 
         TimelineEvent event;
+        event.time = clockSeconds + dayOffset;
+        event.name = inputName;
 
-        event.time =
-            clockSeconds + dayOffset;
-
-        event.name =
-            inputName;
-
-        if (
-            EndsWith(
-                event.name,
-                L"_UP"
-            )
-        )
+        if (EndsWith(event.name, L"_UP"))
         {
             event.down = false;
-
-            event.name.resize(
-                event.name.size() - 3
-            );
-
-            event.name =
-                Trim(event.name);
+            event.name.resize(event.name.size() - 3);
+            event.name = Trim(event.name);
         }
         else
         {
@@ -351,36 +369,38 @@ static bool ParseTimeline(
         }
 
         parsed.push_back(event);
+        sawLegacy = true;
     }
 
     if (parsed.empty())
         return false;
 
-    double firstTime =
-        parsed.front().time;
-
-    for (TimelineEvent& event : parsed)
+    // Compact events are already relative to recording start.
+    // Legacy timestamps need to be normalized against their first event.
+    if (!sawCompact && sawLegacy)
     {
-        event.time -= firstTime;
+        double firstTime = parsed.front().time;
 
-        if (event.time < 0.0)
-            event.time = 0.0;
+        for (TimelineEvent& event : parsed)
+        {
+            event.time -= firstTime;
+
+            if (event.time < 0.0)
+                event.time = 0.0;
+        }
     }
 
     std::stable_sort(
         parsed.begin(),
         parsed.end(),
-        [](const TimelineEvent& a,
-           const TimelineEvent& b)
+        [](const TimelineEvent& a, const TimelineEvent& b)
         {
             return a.time < b.time;
         }
     );
 
     events = parsed;
-
-    duration =
-        events.back().time + 0.5;
+    duration = events.back().time + 0.5;
 
     if (duration < 0.5)
         duration = 0.5;
@@ -1200,9 +1220,11 @@ static void LoadTimelineFromEditor()
             hwndMain,
             L"No valid timeline events were found.\n\n"
             L"Example:\n"
-            L"10:46:46.533 PM    1\n"
-            L"10:46:46.638 PM    2\n"
-            L"10:46:46.654 PM    1_UP",
+            L"672 S+\n"
+            L"125 S-\n"
+            L"0 T+\n"
+            L"110 A+\n"
+            L"31 T-",
             L"Timeline Error",
             MB_OK |
             MB_ICONWARNING
