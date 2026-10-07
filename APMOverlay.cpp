@@ -1203,20 +1203,23 @@ static LRESULT CALLBACK WindowProc(
             if (bottom && right)
                 return HTBOTTOMRIGHT;
 
-            // Sides.
+            // Sides. Keep the bottom and left/right edges as resize grips.
             if (left)
                 return HTLEFT;
 
             if (right)
                 return HTRIGHT;
 
-            if (top)
-                return HTTOP;
-
             if (bottom)
                 return HTBOTTOM;
 
-            // Everything else moves the overlay.
+            // The visible 6px top bar is the drag/move bar.
+            // This lets the user move the overlay without needing
+            // a normal Windows title bar.
+            if (top)
+                return HTCAPTION;
+
+            // Everything else also moves the overlay.
             return HTCAPTION;
         }
 
