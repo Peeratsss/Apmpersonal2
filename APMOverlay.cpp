@@ -64,6 +64,12 @@ static std::map<std::wstring, int> buttonCounts;
 
 static std::vector<std::wstring> timelineLines;
 
+// Compact input timeline state.
+// The first number is elapsed milliseconds since recording began;
+// every following number is elapsed milliseconds since the previous event.
+static ULONGLONG inputRecordingStart = 0;
+static ULONGLONG lastInputEventTime = 0;
+
 // ============================================================
 // FILE PATH
 // ============================================================
@@ -200,7 +206,10 @@ static void SaveInputsFile()
                  << L"\n";
         }
 
-        file << L"\n=== INPUT TIMELINE ===\n\n";
+        file << L"\n=== INPUT TIMELINE (DELTA MS) ===\n";
+        file << L"# First number = milliseconds since recording started.\n";
+        file << L"# Following numbers = milliseconds since previous event.\n";
+        file << L"# NAME+ = press/down, NAME- = release/up.\n\n";
 
         for (const auto& line : timelineLines)
         {
@@ -238,6 +247,8 @@ static void ResetInputTracker()
     buttonCounts.clear();
     timelineLines.clear();
     keyRepeatCounts.clear();
+    inputRecordingStart = GetTickCount64();
+    lastInputEventTime = inputRecordingStart;
 
     LeaveCriticalSection(&actionLock);
 
@@ -303,28 +314,45 @@ static void RecordInput(
     bool isRelease
 )
 {
-    const std::wstring timestamp =
-        GetClockTime();
-
-    std::wstring line =
-        timestamp;
-
-    line += L"\t";
-    line += name;
-
-    if (isRelease)
-        line += L"_UP";
+    const ULONGLONG now = GetTickCount64();
 
     EnterCriticalSection(&actionLock);
+
+    // Start the compact timeline clock on the first recorded event.
+    if (inputRecordingStart == 0)
+    {
+        inputRecordingStart = now;
+        lastInputEventTime = now;
+    }
+
+    ULONGLONG delta = 0;
+
+    if (timelineLines.empty())
+    {
+        // First event: elapsed time since recording started.
+        delta = now - inputRecordingStart;
+    }
+    else
+    {
+        // Every later event: elapsed time since the previous event.
+        delta = now - lastInputEventTime;
+    }
+
+    lastInputEventTime = now;
+
+    // NAME+ = key/button down, NAME- = key/button up.
+    std::wstring line =
+        std::to_wstring(delta);
+
+    line += L" ";
+    line += name;
+    line += isRelease ? L"-" : L"+";
 
     timelineLines.push_back(line);
 
     if (!isRelease)
     {
-        actions.push_back(
-            GetTickCount64()
-        );
-
+        actions.push_back(now);
         buttonCounts[name]++;
     }
 
@@ -1400,6 +1428,9 @@ int WINAPI wWinMain(
     InitializeCriticalSection(
         &actionLock
     );
+
+    inputRecordingStart = GetTickCount64();
+    lastInputEventTime = inputRecordingStart;
 
     LoadSettings();
 

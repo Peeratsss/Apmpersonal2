@@ -7,6 +7,7 @@
 #include <windowsx.h>
 #include <objbase.h>
 #include <wincodec.h>
+#include <gdiplus.h>
 
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 // ============================================================
 // SETTINGS
@@ -56,7 +58,8 @@ static HWND hwndSecondTimeline = nullptr;
 static HWND hwndLoad = nullptr;
 static HWND hwndPlay = nullptr;
 static HWND hwndReset = nullptr;
-static HWND hwndExportPNG = nullptr;
+static HWND hwndExportGIF = nullptr;
+static ULONG_PTR gdiplusToken = 0;
 
 static std::vector<TimelineEvent> events;
 static std::vector<std::wstring> heldKeys;
@@ -1223,12 +1226,111 @@ static void LoadTimelineFromEditor()
 }
 
 // ============================================================
-// EXPORT HELPERS
+// GET EXE DIRECTORY
 // ============================================================
 
+static std::wstring GetExeDirectory()
+{
+    wchar_t path[MAX_PATH]{};
+
+    GetModuleFileNameW(
+        nullptr,
+        path,
+        MAX_PATH
+    );
+
+    std::wstring result(path);
+
+    size_t slash =
+        result.find_last_of(L"\\/");
+
+    if (slash != std::wstring::npos)
+        result.resize(slash);
+
+    return result;
+}
+
+// ============================================================
+// GIF EXPORT
+// ============================================================
+
+static bool GetEncoderClsid(
+    const WCHAR* mimeType,
+    CLSID* clsid
+)
+{
+    UINT num = 0;
+    UINT size = 0;
+
+    if (
+        GetImageEncodersSize(
+            &num,
+            &size
+        ) != Ok ||
+        size == 0
+    )
+    {
+        return false;
+    }
+
+    std::vector<BYTE> buffer(size);
+
+    ImageCodecInfo* codecs =
+        reinterpret_cast<ImageCodecInfo*>(
+            buffer.data()
+        );
+
+    if (
+        GetImageEncoders(
+            num,
+            size,
+            codecs
+        ) != Ok
+    )
+    {
+        return false;
+    }
+
+    for (UINT i = 0; i < num; ++i)
+    {
+        if (
+            wcscmp(
+                codecs[i].MimeType,
+                mimeType
+            ) == 0
+        )
+        {
+            *clsid = codecs[i].Clsid;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool SetGIFProperty(
+    Bitmap* bitmap,
+    PROPID id,
+    ULONG type,
+    ULONG valueSize,
+    void* value
+)
+{
+    UINT itemSize =
+        sizeof(PropertyItem);
+
+    PropertyItem item{};
+
+    item.id = id;
+    item.length = valueSize;
+    item.type = type;
+    item.value = value;
+
+    return bitmap->SetPropertyItem(&item) == Ok;
+}
+
 static HBITMAP CreateVideoBitmap(
-    HDC* outDC,
-    void** outBits
+    HDC* outDC
 )
 {
     HDC screen =
@@ -1236,6 +1338,14 @@ static HBITMAP CreateVideoBitmap(
 
     HDC memDC =
         CreateCompatibleDC(screen);
+
+    ReleaseDC(
+        nullptr,
+        screen
+    );
+
+    if (!memDC)
+        return nullptr;
 
     BITMAPINFO bmi{};
 
@@ -1269,11 +1379,6 @@ static HBITMAP CreateVideoBitmap(
             0
         );
 
-    ReleaseDC(
-        nullptr,
-        screen
-    );
-
     if (!bitmap)
     {
         DeleteDC(memDC);
@@ -1281,178 +1386,121 @@ static HBITMAP CreateVideoBitmap(
     }
 
     *outDC = memDC;
-    *outBits = bits;
 
     return bitmap;
 }
 
-// ============================================================
-// GET EXE DIRECTORY
-// ============================================================
-
-static std::wstring GetExeDirectory()
+static Bitmap* RenderGIFFrame(
+    HDC videoDC,
+    HBITMAP videoBitmap,
+    int outputWidth,
+    int outputHeight
+)
 {
-    wchar_t path[MAX_PATH]{};
-
-    GetModuleFileNameW(
-        nullptr,
-        path,
-        MAX_PATH
+    RenderScene(
+        videoDC,
+        VIDEO_WIDTH,
+        VIDEO_HEIGHT
     );
 
-    std::wstring result(path);
+    Bitmap source(
+        videoBitmap,
+        nullptr
+    );
 
-    size_t slash =
-        result.find_last_of(L"\\/");
+    Bitmap* frame =
+        new Bitmap(
+            outputWidth,
+            outputHeight,
+            PixelFormat32bppARGB
+        );
 
-    if (slash != std::wstring::npos)
-        result.resize(slash);
+    if (
+        frame->GetLastStatus() != Ok
+    )
+    {
+        delete frame;
+        return nullptr;
+    }
 
-    return result;
+    Graphics graphics(frame);
+
+    graphics.SetInterpolationMode(
+        InterpolationModeHighQualityBicubic
+    );
+
+    graphics.SetPixelOffsetMode(
+        PixelOffsetModeHighQuality
+    );
+
+    Rect destination(
+        0,
+        0,
+        outputWidth,
+        outputHeight
+    );
+
+    if (
+        graphics.DrawImage(
+            &source,
+            destination
+        ) != Ok
+    )
+    {
+        delete frame;
+        return nullptr;
+    }
+
+    return frame;
 }
 
-// ============================================================
-// EXPORT PNG SEQUENCE
-// ============================================================
-
-static bool ExportPNGSequence()
+static bool ExportGIF()
 {
     if (events.empty())
     {
         MessageBoxW(
             hwndMain,
             L"Load a timeline first.",
-            L"Export PNG",
-            MB_OK |
-            MB_ICONWARNING
+            L"Export GIF",
+            MB_OK | MB_ICONWARNING
         );
 
         return false;
     }
 
-    std::wstring outputFolder =
+    if (gdiplusToken == 0)
+        return false;
+
+    const int outputWidth =
+        std::min(
+            VIDEO_WIDTH,
+            1280
+        );
+
+    const int outputHeight =
+        std::min(
+            VIDEO_HEIGHT,
+            720
+        );
+
+    std::wstring outputPath =
         GetExeDirectory() +
-        L"\\APM_Replay_Frames";
-
-    CreateDirectoryW(
-        outputFolder.c_str(),
-        nullptr
-    );
-
-    std::wstring searchPattern =
-        outputFolder +
-        L"\\frame_*.png";
-
-    WIN32_FIND_DATAW findData{};
-
-    HANDLE findHandle =
-        FindFirstFileW(
-            searchPattern.c_str(),
-            &findData
-        );
-
-    if (findHandle != INVALID_HANDLE_VALUE)
-    {
-        do
-        {
-            if (
-                !(findData.dwFileAttributes &
-                  FILE_ATTRIBUTE_DIRECTORY)
-            )
-            {
-                std::wstring oldFile =
-                    outputFolder +
-                    L"\\" +
-                    findData.cFileName;
-
-                DeleteFileW(
-                    oldFile.c_str()
-                );
-            }
-
-        } while (
-            FindNextFileW(
-                findHandle,
-                &findData
-            )
-        );
-
-        FindClose(findHandle);
-    }
-
-    HRESULT hr =
-        CoInitializeEx(
-            nullptr,
-            COINIT_MULTITHREADED
-        );
-
-    bool comInitialized =
-        SUCCEEDED(hr);
-
-    if (
-        FAILED(hr) &&
-        hr != RPC_E_CHANGED_MODE
-    )
-    {
-        MessageBoxW(
-            hwndMain,
-            L"Could not initialize Windows Imaging Component.",
-            L"PNG Export Failed",
-            MB_OK |
-            MB_ICONERROR
-        );
-
-        return false;
-    }
-
-    IWICImagingFactory* factory = nullptr;
-
-    hr =
-        CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory)
-        );
-
-    if (FAILED(hr))
-    {
-        if (comInitialized)
-            CoUninitialize();
-
-        MessageBoxW(
-            hwndMain,
-            L"Could not initialize the PNG encoder.",
-            L"PNG Export Failed",
-            MB_OK |
-            MB_ICONERROR
-        );
-
-        return false;
-    }
+        L"\\APM_Replay.gif";
 
     HDC videoDC = nullptr;
-    void* bits = nullptr;
 
-    HBITMAP bitmap =
+    HBITMAP videoBitmap =
         CreateVideoBitmap(
-            &videoDC,
-            &bits
+            &videoDC
         );
 
-    if (!bitmap)
+    if (!videoBitmap)
     {
-        factory->Release();
-
-        if (comInitialized)
-            CoUninitialize();
-
         MessageBoxW(
             hwndMain,
-            L"Could not create the video rendering surface.",
-            L"PNG Export Failed",
-            MB_OK |
-            MB_ICONERROR
+            L"Could not create the rendering surface.",
+            L"GIF Export Failed",
+            MB_OK | MB_ICONERROR
         );
 
         return false;
@@ -1462,213 +1510,254 @@ static bool ExportPNGSequence()
         static_cast<HBITMAP>(
             SelectObject(
                 videoDC,
-                bitmap
+                videoBitmap
             )
         );
 
-    const long long totalFrames =
-        static_cast<long long>(
-            std::ceil(
-                duration *
-                static_cast<double>(FPS)
-            )
+    CLSID gifClsid{};
+
+    if (
+        !GetEncoderClsid(
+            L"image/gif",
+            &gifClsid
+        )
+    )
+    {
+        SelectObject(
+            videoDC,
+            oldBitmap
         );
 
-    const size_t pixelCount =
-        static_cast<size_t>(VIDEO_WIDTH) *
-        static_cast<size_t>(VIDEO_HEIGHT);
+        DeleteObject(videoBitmap);
+        DeleteDC(videoDC);
 
-    const size_t byteCount =
-        pixelCount * 4;
+        MessageBoxW(
+            hwndMain,
+            L"Could not find the Windows GIF encoder.",
+            L"GIF Export Failed",
+            MB_OK | MB_ICONERROR
+        );
 
-    std::vector<BYTE> bgraPixels(
-        byteCount
-    );
+        return false;
+    }
+
+    const double savedTime =
+        currentTime;
+
+    const bool savedPlaying =
+        playing;
+
+    playing = false;
+
+    std::vector<double> frameTimes;
+
+    // The GIF only gets a new frame when the input state changes.
+    // Time between changes is represented by the GIF frame delay.
+    frameTimes.push_back(0.0);
+
+    for (const TimelineEvent& event : events)
+    {
+        if (event.time <= 0.0)
+            continue;
+
+        if (
+            frameTimes.empty() ||
+            event.time >
+                frameTimes.back() + 0.0000001
+        )
+        {
+            frameTimes.push_back(
+                event.time
+            );
+        }
+    }
 
     bool success = true;
 
-    // Export at fixed FPS, but advance the exact event timeline
-    // incrementally. There are still normal video frames during
-    // idle periods, but those frames contain no invented input
-    // events; the held state only changes at the real timestamps.
-    const double savedTime = currentTime;
-    const bool savedPlaying = playing;
+    DeleteFileW(
+        outputPath.c_str()
+    );
 
-    ResetPlaybackState();
+    Bitmap* firstFrame = nullptr;
+
+    EncoderParameters saveParameters{};
+
+    saveParameters.Count = 1;
+
+    saveParameters.Parameter[0].Guid =
+        EncoderSaveFlag;
+
+    saveParameters.Parameter[0].Type =
+        EncoderParameterValueTypeLong;
+
+    saveParameters.Parameter[0].NumberOfValues =
+        1;
+
+    ULONG saveFlag =
+        EncoderValueMultiFrame;
+
+    saveParameters.Parameter[0].Value =
+        &saveFlag;
 
     for (
-        long long frame = 0;
-        frame < totalFrames;
-        ++frame
+        size_t i = 0;
+        i < frameTimes.size();
+        ++i
     )
     {
         currentTime =
-            static_cast<double>(frame) /
-            static_cast<double>(FPS);
+            frameTimes[i];
+
+        ResetPlaybackState();
 
         ProcessEventsTo(
             currentTime
         );
 
-        RenderScene(
-            videoDC,
-            VIDEO_WIDTH,
-            VIDEO_HEIGHT
-        );
-
-        BYTE* source =
-            static_cast<BYTE*>(bits);
-
-        for (
-            size_t i = 0;
-            i < pixelCount;
-            ++i
-        )
-        {
-            bgraPixels[i * 4 + 0] =
-                source[i * 4 + 0];
-
-            bgraPixels[i * 4 + 1] =
-                source[i * 4 + 1];
-
-            bgraPixels[i * 4 + 2] =
-                source[i * 4 + 2];
-
-            bgraPixels[i * 4 + 3] =
-                255;
-        }
-
-        wchar_t filename[64]{};
-
-        swprintf_s(
-            filename,
-            L"frame_%06lld.png",
-            frame
-        );
-
-        std::wstring outputPath =
-            outputFolder +
-            L"\\" +
-            filename;
-
-        IWICStream* stream = nullptr;
-        IWICBitmapEncoder* encoder = nullptr;
-        IWICBitmapFrameEncode* frameEncoder = nullptr;
-        IPropertyBag2* propertyBag = nullptr;
-
-        hr =
-            factory->CreateStream(
-                &stream
+        Bitmap* frame =
+            RenderGIFFrame(
+                videoDC,
+                videoBitmap,
+                outputWidth,
+                outputHeight
             );
 
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                stream->InitializeFromFilename(
-                    outputPath.c_str(),
-                    GENERIC_WRITE
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                factory->CreateEncoder(
-                    GUID_ContainerFormatPng,
-                    nullptr,
-                    &encoder
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                encoder->Initialize(
-                    stream,
-                    WICBitmapEncoderNoCache
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                encoder->CreateNewFrame(
-                    &frameEncoder,
-                    &propertyBag
-                );
-        }
-
-        if (propertyBag)
-        {
-            propertyBag->Release();
-            propertyBag = nullptr;
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                frameEncoder->Initialize(
-                    nullptr
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                frameEncoder->SetSize(
-                    VIDEO_WIDTH,
-                    VIDEO_HEIGHT
-                );
-        }
-
-        WICPixelFormatGUID pixelFormat =
-            GUID_WICPixelFormat32bppBGRA;
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                frameEncoder->SetPixelFormat(
-                    &pixelFormat
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                frameEncoder->WritePixels(
-                    VIDEO_HEIGHT,
-                    VIDEO_WIDTH * 4,
-                    static_cast<UINT>(byteCount),
-                    bgraPixels.data()
-                );
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                frameEncoder->Commit();
-        }
-
-        if (SUCCEEDED(hr))
-        {
-            hr =
-                encoder->Commit();
-        }
-
-        if (frameEncoder)
-            frameEncoder->Release();
-
-        if (encoder)
-            encoder->Release();
-
-        if (stream)
-            stream->Release();
-
-        if (FAILED(hr))
+        if (!frame)
         {
             success = false;
             break;
         }
+
+        double nextTime =
+            (i + 1 < frameTimes.size())
+                ? frameTimes[i + 1]
+                : duration;
+
+        double delaySeconds =
+            nextTime - frameTimes[i];
+
+        if (delaySeconds <= 0.0)
+            delaySeconds = 0.01;
+
+        ULONG delay =
+            static_cast<ULONG>(
+                std::max(
+                    1.0,
+                    std::round(
+                        delaySeconds * 100.0
+                    )
+                )
+            );
+
+        SetGIFProperty(
+            frame,
+            PropertyTagFrameDelay,
+            PropertyTagTypeLong,
+            sizeof(ULONG),
+            &delay
+        );
+
+        // 0 means infinite looping.
+        USHORT loopCount = 0;
+
+        SetGIFProperty(
+            frame,
+            PropertyTagLoopCount,
+            PropertyTagTypeShort,
+            sizeof(USHORT),
+            &loopCount
+        );
+
+        if (i == 0)
+        {
+            firstFrame = frame;
+
+            if (
+                firstFrame->Save(
+                    outputPath.c_str(),
+                    &gifClsid,
+                    &saveParameters
+                ) != Ok
+            )
+            {
+                success = false;
+                delete firstFrame;
+                firstFrame = nullptr;
+                break;
+            }
+        }
+        else
+        {
+            EncoderParameters addParameters{};
+
+            addParameters.Count = 1;
+
+            addParameters.Parameter[0].Guid =
+                EncoderSaveFlag;
+
+            addParameters.Parameter[0].Type =
+                EncoderParameterValueTypeLong;
+
+            addParameters.Parameter[0].NumberOfValues =
+                1;
+
+            ULONG addFlag =
+                EncoderValueFrameDimensionTime;
+
+            addParameters.Parameter[0].Value =
+                &addFlag;
+
+            if (
+                firstFrame->SaveAdd(
+                    frame,
+                    &addParameters
+                ) != Ok
+            )
+            {
+                success = false;
+                delete frame;
+                break;
+            }
+
+            delete frame;
+        }
+    }
+
+    if (
+        success &&
+        firstFrame
+    )
+    {
+        saveFlag =
+            EncoderValueFlush;
+
+        EncoderParameters flushParameters{};
+
+        flushParameters.Count = 1;
+
+        flushParameters.Parameter[0].Guid =
+            EncoderSaveFlag;
+
+        flushParameters.Parameter[0].Type =
+            EncoderParameterValueTypeLong;
+
+        flushParameters.Parameter[0].NumberOfValues =
+            1;
+
+        flushParameters.Parameter[0].Value =
+            &saveFlag;
+
+        if (
+            firstFrame->SaveAdd(
+                &flushParameters
+            ) != Ok
+        )
+        {
+            success = false;
+        }
+
+        delete firstFrame;
+        firstFrame = nullptr;
     }
 
     SelectObject(
@@ -1676,54 +1765,59 @@ static bool ExportPNGSequence()
         oldBitmap
     );
 
-    DeleteObject(bitmap);
+    DeleteObject(videoBitmap);
     DeleteDC(videoDC);
 
-    factory->Release();
+    currentTime =
+        savedTime;
 
-    if (comInitialized)
-        CoUninitialize();
+    playing =
+        savedPlaying;
 
-    currentTime = savedTime;
-    playing = savedPlaying;
     ResetPlaybackState();
-    ProcessEventsTo(currentTime);
 
-    if (success)
-    {
-        std::wstring message =
-            L"PNG sequence exported successfully:\n\n" +
-            outputFolder +
-            L"\n\n" +
-            std::to_wstring(totalFrames) +
-            L" frames at " +
-            std::to_wstring(FPS) +
-            L" FPS.";
-
-        MessageBoxW(
-            hwndMain,
-            message.c_str(),
-            L"Export Complete",
-            MB_OK |
-            MB_ICONINFORMATION
-        );
-    }
-    else
-    {
-        MessageBoxW(
-            hwndMain,
-            L"PNG sequence export failed.",
-            L"Export Failed",
-            MB_OK |
-            MB_ICONERROR
-        );
-    }
+    ProcessEventsTo(
+        currentTime
+    );
 
     InvalidateRect(
         hwndMain,
         nullptr,
         TRUE
     );
+
+    if (success)
+    {
+        std::wstring message =
+            L"GIF exported successfully:\\n\\n" +
+            outputPath +
+            L"\\n\\n" +
+            std::to_wstring(
+                frameTimes.size()
+            ) +
+            L" logical frames.\\n" +
+            std::to_wstring(outputWidth) +
+            L"x" +
+            std::to_wstring(outputHeight) +
+            L"\\n\\n"
+            L"Frames are created only when the input state changes.";
+
+        MessageBoxW(
+            hwndMain,
+            message.c_str(),
+            L"Export Complete",
+            MB_OK | MB_ICONINFORMATION
+        );
+    }
+    else
+    {
+        MessageBoxW(
+            hwndMain,
+            L"GIF export failed.",
+            L"Export Failed",
+            MB_OK | MB_ICONERROR
+        );
+    }
 
     return success;
 }
@@ -1890,10 +1984,10 @@ static LRESULT CALLBACK WindowProc(
                     nullptr
                 );
 
-            hwndExportPNG =
+            hwndExportGIF =
                 CreateWindowW(
                     L"BUTTON",
-                    L"Export PNG",
+                    L"Export GIF",
                     WS_CHILD |
                     WS_VISIBLE |
                     BS_PUSHBUTTON,
@@ -2002,7 +2096,7 @@ static LRESULT CALLBACK WindowProc(
                 }
 
                 case 1005:
-                    ExportPNGSequence();
+                    ExportGIF();
                     return 0;
             }
 
@@ -2262,6 +2356,26 @@ int WINAPI wWinMain(
     int nCmdShow
 )
 {
+    GdiplusStartupInput gdiplusStartupInput{};
+
+    if (
+        GdiplusStartup(
+            &gdiplusToken,
+            &gdiplusStartupInput,
+            nullptr
+        ) != Ok
+    )
+    {
+        MessageBoxW(
+            nullptr,
+            L"Could not initialize GDI+.",
+            L"APM Timeline Visualizer",
+            MB_OK | MB_ICONERROR
+        );
+
+        return 1;
+    }
+
     WNDCLASSW wc{};
 
     wc.lpfnWndProc =
@@ -2328,6 +2442,12 @@ int WINAPI wWinMain(
     {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
+    }
+
+    if (gdiplusToken != 0)
+    {
+        GdiplusShutdown(gdiplusToken);
+        gdiplusToken = 0;
     }
 
     return static_cast<int>(
