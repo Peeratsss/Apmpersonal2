@@ -10,27 +10,37 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Initialize MSVC x64
-        shell: cmd
-        run: call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-
-      - name: Build APM Overlay
+      - name: Locate Visual Studio
         shell: cmd
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL (
+            echo Visual Studio installation not found.
+            exit /b 1
+          )
+          echo Using Visual Studio at: %VSINSTALL%
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cl
+
+      - name: Build APMOverlay
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cl /nologo /O2 /EHsc APMOverlay.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OUT:APMOverlay.exe
 
-      - name: Build Timeline Visualizer
+      - name: Build APMTimelineVisualizer
         shell: cmd
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib shell32.lib ole32.lib gdiplus.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib shell32.lib comdlg32.lib gdiplus.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
 
       - name: Upload executables
         uses: actions/upload-artifact@v4
@@ -39,4 +49,3 @@ jobs:
           path: |
             APMOverlay.exe
             APMTimelineVisualizer.exe
-          if-no-files-found: error
