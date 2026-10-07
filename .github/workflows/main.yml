@@ -1,12 +1,10 @@
 name: Build APM Tools
 
 on:
-  workflow_dispatch:
   push:
-    paths:
-      - 'APMOverlay.cpp'
-      - 'APMTimelineVisualizer.cpp'
-      - '.github/workflows/main.yml'
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   build:
@@ -16,36 +14,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Locate Visual Studio
-        shell: cmd
-        run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
-          if not defined VSINSTALL (
-            echo Visual Studio installation not found.
-            exit /b 1
-          )
-          echo Using Visual Studio at: %VSINSTALL%
-          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          cl
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Build APMOverlay
+      - name: Build APM Overlay
         shell: cmd
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
-          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
           cl /nologo /O2 /EHsc APMOverlay.cpp user32.lib gdi32.lib shell32.lib /link /SUBSYSTEM:WINDOWS /OUT:APMOverlay.exe
 
-      - name: Build APMTimelineVisualizer
+      - name: Build APM Timeline Visualizer
         shell: cmd
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
-          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib shell32.lib comdlg32.lib gdiplus.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
+          cl /nologo /O2 /EHsc APMTimelineVisualizer.cpp user32.lib gdi32.lib gdiplus.lib /link /SUBSYSTEM:WINDOWS /OUT:APMTimelineVisualizer.exe
 
-      - name: Upload executables
+      - name: Prepare release files
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item APMOverlay.exe release\APMOverlay.exe
+          Copy-Item APMTimelineVisualizer.exe release\APMTimelineVisualizer.exe
+          Copy-Item image.png release\image.png
+
+      - name: Create APM Tools ZIP
+        shell: powershell
+        run: |
+          Compress-Archive -Path release\* -DestinationPath APM-Tools.zip -Force
+
+      - name: Upload APM Tools ZIP
         uses: actions/upload-artifact@v4
         with:
           name: APM-Tools
-          path: |
-            APMOverlay.exe
-            APMTimelineVisualizer.exe
+          path: APM-Tools.zip
+          if-no-files-found: error
